@@ -94,6 +94,17 @@ class TestStreamableHttpMount:
         assert "mcp-session-id" in resp.headers
         assert '"serverInfo"' in resp.text
 
+    def test_handshake_includes_server_instructions(self, client, token):
+        resp = client.post(
+            "/mcp", json=INITIALIZE_BODY, headers={**MCP_HEADERS, "Authorization": f"Bearer {token}"}
+        )
+        assert resp.status_code == 200
+        assert '"instructions"' in resp.text
+        # Spot-check a couple of pieces of the recommended tool-call ordering guidance
+        # actually made it into the wire response, not just some `instructions` key.
+        assert "fetch_and_process_unread" in resp.text
+        assert "send_email_reply" in resp.text
+
     def test_invalid_token_401s(self, client, token):
         resp = client.post(
             "/mcp", json=INITIALIZE_BODY, headers={**MCP_HEADERS, "Authorization": "Bearer not-a-real-token"}

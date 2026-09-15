@@ -111,12 +111,37 @@ class RobustFastMCP(FastMCP):
         return await super().call_tool(cleaned_name, arguments)
 
 security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+MCP_SERVER_INSTRUCTIONS = """Email Triage Engine: a tiered pipeline that pulls unread mail from \
+Gmail/IMAP, filters noise for free, classifies the rest with a cheap LLM, and escalates only \
+high-priority items to a premium LLM for executive summaries. Results are cached, so repeated \
+calls for already-seen messages are free.
+
+Recommended tool-call ordering: call a read-only/status tool before any mutating tool.
+- Read-only / status first: fetch_and_process_unread (cache-only -- never hits Gmail/IMAP \
+directly; call trigger_download or check get_last_download_time first if the cache might be \
+stale), get_last_download_time, search_emails (live mailbox search), fetch_full_email.
+- Mutating (change mailbox/cache state): trigger_download (kicks off a background sync), \
+mark_emails_as_read, create_new_draft, create_draft_reply, and send_email_reply -- the last is \
+irreversible (actually sends mail) and should be used with the most caution.
+
+Cross-cutting caveats:
+- Most tools take a `profile` argument identifying which mailbox/account to operate on; omitting \
+it uses the "default" profile.
+- fetch_and_process_unread never triggers a live download itself -- pair it with \
+trigger_download/get_last_download_time if you need fresh data rather than whatever was last \
+synced.
+
+For per-tool parameter/return details, load individual tool schemas on demand after reading this \
+overview."""
+
 mcp = RobustFastMCP(
     "Email Triage Engine",
     host=settings.mcp_host,
     port=settings.mcp_port,
     transport_security=security,
-    warn_on_duplicate_tools=False
+    warn_on_duplicate_tools=False,
+    instructions=MCP_SERVER_INSTRUCTIONS,
 )
 
 # New auth/user-management/settings dashboard routes (login, users, MCP tokens,
