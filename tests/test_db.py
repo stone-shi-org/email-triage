@@ -496,7 +496,8 @@ class TestEmailDBDisplayCountAndAutoMarkRead:
 
 class TestEmailDBEmailCounts:
     def test_counts_by_level_and_pending(self, db):
-        db.upsert_email_metadata(message_id="<pending@test.com>", account="acct-a@test.com")
+        db.upsert_email_metadata(message_id="<pending@test.com>", account="acct-a@test.com", is_unread=True)
+        db.upsert_email_metadata(message_id="<archived@test.com>", account="acct-a@test.com")
         db.save_triage_result(
             message_id="<l0@test.com>", account="acct-a@test.com", sender="s", subject="sub",
             date_str="d", level_0_status="filtered", triage_level=0, tag="low",
@@ -512,7 +513,14 @@ class TestEmailDBEmailCounts:
         db.upsert_email_metadata(message_id="<other-acct@test.com>", account="acct-b@test.com")
 
         counts = db.get_email_counts("acct-a@test.com")
-        assert counts == {"total": 4, "level_0": 1, "level_1": 1, "level_2": 1, "pending_triage": 1}
+        assert counts == {
+            "total": 5,
+            "level_0": 1,
+            "level_1": 1,
+            "level_2": 1,
+            "pending_triage": 1,
+            "archived_untriaged": 1,
+        }
 
     def test_counts_across_all_accounts_when_unscoped(self, db):
         db.upsert_email_metadata(message_id="<a@test.com>", account="acct-a@test.com")
@@ -520,11 +528,44 @@ class TestEmailDBEmailCounts:
 
         counts = db.get_email_counts()
         assert counts["total"] == 2
+        assert counts["archived_untriaged"] == 2
+        assert counts["pending_triage"] == 0
 
     def test_counts_empty_db(self, db):
         assert db.get_email_counts("nobody@test.com") == {
-            "total": 0, "level_0": 0, "level_1": 0, "level_2": 0, "pending_triage": 0,
+            "total": 0, "level_0": 0, "level_1": 0, "level_2": 0, "pending_triage": 0, "archived_untriaged": 0,
         }
+
+    def test_counts_distinguishes_pending_unread_and_archived_untriaged(self, db):
+        # 1. Unread row awaiting triage (is_unread=1, triage_level=NULL)
+        db.upsert_email_metadata(message_id="<m-pending@test.com>", account="acct@test.com", is_unread=True)
+        # 2. Archive row untriaged (is_unread=NULL, triage_level=NULL)
+        db.upsert_email_metadata(message_id="<m-arch-null@test.com>", account="acct@test.com")
+        # 3. Read row untriaged (is_unread=0, triage_level=NULL)
+        db.upsert_email_metadata(message_id="<m-arch-zero@test.com>", account="acct@test.com", is_unread=False)
+        # 4. Triaged rows with varying unread states
+        db.upsert_email_metadata(message_id="<m-triaged-unread@test.com>", account="acct@test.com", is_unread=True)
+        db.save_triage_result(
+            message_id="<m-triaged-unread@test.com>", account="acct@test.com", sender="s", subject="sub",
+            date_str="d", level_0_status="filtered", triage_level=0, tag="low",
+        )
+        db.upsert_email_metadata(message_id="<m-triaged-read@test.com>", account="acct@test.com", is_unread=False)
+        db.save_triage_result(
+            message_id="<m-triaged-read@test.com>", account="acct@test.com", sender="s", subject="sub",
+            date_str="d", level_0_status="passed", triage_level=2, tag="vip",
+        )
+
+        counts = db.get_email_counts("acct@test.com")
+        assert counts["total"] == 5
+        assert counts["level_0"] == 1
+        assert counts["level_1"] == 0
+        assert counts["level_2"] == 1
+        assert counts["pending_triage"] == 1
+        assert counts["archived_untriaged"] == 2
+        assert counts["total"] == (
+            counts["level_0"] + counts["level_1"] + counts["level_2"] +
+            counts["pending_triage"] + counts["archived_untriaged"]
+        )
 
 
 class TestEmailDBDailyTokenStats:

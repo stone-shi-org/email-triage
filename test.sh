@@ -57,7 +57,7 @@ run_frontend_checks() {
         return
     fi
     echo "==> Running frontend typecheck (web/)..."
-    (cd "$SCRIPT_DIR/web" && npm install --silent && npm run typecheck)
+    (cd "$SCRIPT_DIR/web" && NODE_ENV=development npm install --silent && npm run typecheck)
     echo "--> Frontend typecheck complete."
 }
 

@@ -24,6 +24,9 @@ function AccountCard({ account, kind }: { account: any; kind: string }) {
           <span>L1: {account.counts.level_1}</span>
           <span>L0: {account.counts.level_0}</span>
           <span>Pending: {account.counts.pending_triage}</span>
+          {account.counts.archived_untriaged > 0 && (
+            <span>Archived: {account.counts.archived_untriaged}</span>
+          )}
         </div>
       )}
       {account.summary?.errors?.length > 0 && (

@@ -1672,3 +1672,114 @@ class TestTokenMappedProfileInBackgroundSync:
         assert result["profile"] == "jenny"
         assert done.wait(timeout=2)
         assert seen["arg"] == "jenny"
+
+    def test_trigger_download_all_resolves_to_token_mapped_profile(self, monkeypatch):
+        seen = {}
+        done = threading.Event()
+
+        def fake_sync(p):
+            seen["arg"] = p
+            seen["ctx"] = mcp_server.current_profile.get("default")
+            done.set()
+            return {"profile": p, "status": "ok"}
+
+        monkeypatch.setattr(mcp_server, "sync_profile", fake_sync)
+        monkeypatch.setattr(mcp_server, "sync_all_profiles", MagicMock(side_effect=AssertionError("must not call sync_all_profiles")))
+
+        token = mcp_server.current_profile.set("stone")
+        try:
+            result = mcp_server.trigger_download(profile="all")
+        finally:
+            mcp_server.current_profile.reset(token)
+
+        assert result == {"status": "started", "profile": "stone"}
+        assert done.wait(timeout=2)
+        assert seen["arg"] == "stone"
+
+    def test_get_last_download_time_all_resolves_to_token_mapped_profile(self, monkeypatch):
+        db = MagicMock(spec=EmailDB)
+        db.get_sync_summary.return_value = None
+        db.get_email_counts.return_value = {
+            "total": 10, "level_0": 5, "level_1": 3, "level_2": 2, "pending_triage": 0, "archived_untriaged": 0
+        }
+        settings = MagicMock()
+        settings.gmail_account = "stone@gmail.com"
+        settings.imap_login = "stone@imap.com"
+        monkeypatch.setattr(mcp_server, "get_resources", lambda p: (db, MagicMock(), settings))
+        monkeypatch.setattr(mcp_server, "_resolve_account_metadata", lambda p: None)
+
+        token = mcp_server.current_profile.set("stone")
+        try:
+            status = mcp_server.get_last_download_time(profile="all")
+        finally:
+            mcp_server.current_profile.reset(token)
+
+        assert status["profile"] == "stone"
+        assert "profiles" not in status
+
+    def test_sync_profile_normalizes_cross_profile_call(self, monkeypatch):
+        seen_profile = {}
+        db = MagicMock(spec=EmailDB)
+        db.get_sync_summary.return_value = None
+        settings = MagicMock()
+        settings.is_gmail_configured.return_value = False
+        settings.is_imap_configured.return_value = False
+
+        monkeypatch.setattr(
+            mcp_server,
+            "_db_integration_accounts",
+            lambda p, s, **kwargs: (seen_profile.setdefault("db_profile", p), None)[1],
+        )
+        monkeypatch.setattr(
+            mcp_server,
+            "get_resources",
+            lambda p: (seen_profile.setdefault("res_profile", p), db, MagicMock(), settings)[1:],
+        )
+
+        token = mcp_server.current_profile.set("stone")
+        try:
+            res = mcp_server.sync_profile("jenny")
+        finally:
+            mcp_server.current_profile.reset(token)
+
+        assert res["profile"] == "stone"
+        assert seen_profile["db_profile"] == "stone"
+        assert seen_profile["res_profile"] == "stone"
+
+    def test_admin_token_can_trigger_all_and_other_profiles(self, monkeypatch):
+        called = {}
+        done = threading.Event()
+        monkeypatch.setattr(mcp_server, "sync_all_profiles", lambda: (called.setdefault("all", True), done.set()))
+        monkeypatch.setattr(mcp_server, "list_profile_names", lambda: ["admin", "stone", "jenny"])
+
+        token_prof = mcp_server.current_profile.set("admin")
+        token_adm = mcp_server.current_is_admin.set(True)
+        try:
+            res = mcp_server.trigger_download(profile="all")
+            assert res["status"] == "started"
+            assert res["profile"] == "all"
+            assert done.wait(timeout=2)
+            assert called.get("all") is True
+
+            # Admin can also target a specific profile
+            done_jenny = threading.Event()
+            monkeypatch.setattr(mcp_server, "sync_profile", lambda p: (called.setdefault("target", p), done_jenny.set()))
+            res_jenny = mcp_server.trigger_download(profile="jenny")
+            assert res_jenny["profile"] == "jenny"
+            assert done_jenny.wait(timeout=2)
+            assert called.get("target") == "jenny"
+        finally:
+            mcp_server.current_profile.reset(token_prof)
+            mcp_server.current_is_admin.reset(token_adm)
+
+    def test_unscoped_context_can_trigger_all(self, monkeypatch):
+        called = {}
+        done = threading.Event()
+        monkeypatch.setattr(mcp_server, "sync_all_profiles", lambda: (called.setdefault("all", True), done.set()))
+        monkeypatch.setattr(mcp_server, "list_profile_names", lambda: ["admin", "stone"])
+
+        res = mcp_server.trigger_download(profile="all")
+        assert res["status"] == "started"
+        assert res["profile"] == "all"
+        assert done.wait(timeout=2)
+        assert called.get("all") is True

@@ -159,16 +159,22 @@ from starlette.requests import Request
 
 # ContextVar to store the authenticated profile name for the current request
 current_profile = contextvars.ContextVar("current_profile", default="default")
+current_is_admin = contextvars.ContextVar("current_is_admin", default=False)
 
 
 def _effective_profile(profile_name: str) -> str:
-    """The profile a request actually acts on: the token-mapped one when the
-    request carries a profile-scoped token, else the name the caller passed.
-    Mirrors get_resources()' own override, so code that keys state by profile
-    name (per-profile locks, stop events, sync threads) agrees with the
-    settings get_resources() loads -- ET-3."""
+    """The profile a request actually acts on:
+    - An admin context may act on any profile or "all" (with "default" mapping to the admin's mapped profile).
+    - A non-admin token-mapped context is strictly restricted to its mapped profile (any profile including "all" resolves to mapped).
+    - An unscoped context (current_profile == "default" and not admin, e.g. stdio or background schedulers) acts on whatever name was passed -- ET-3, ET-4."""
     mapped = current_profile.get("default")
-    return mapped if mapped != "default" else profile_name
+    if current_is_admin.get(False):
+        if profile_name == "default" and mapped != "default":
+            return mapped
+        return profile_name
+    if mapped != "default":
+        return mapped
+    return profile_name
 
 
 def _start_background(target, *args) -> None:
@@ -309,7 +315,7 @@ class AppAuthMiddleware:
     def __init__(self, app, token_map: Dict[str, str]):
         self.app = app
         self.token_map = token_map
-        self._session_profiles: Dict[str, str] = {}
+        self._session_profiles: Dict[str, Tuple[str, bool]] = {}
 
     async def __call__(self, scope, receive, send):
         if scope["type"] in ("http", "websocket"):
@@ -329,19 +335,19 @@ class AppAuthMiddleware:
                     query_params = QueryParams(scope.get("query_string", b"").decode("utf-8"))
                     token = query_params.get("token")
 
-                profile = self._resolve_profile(token)
+                resolved = self._resolve_profile(token)
 
                 is_messages = path.startswith("/messages")
                 if is_messages:
                     query_params = QueryParams(scope.get("query_string", b"").decode("utf-8"))
                     session_id = query_params.get("session_id")
-                    if profile is None and session_id:
+                    if resolved is None and session_id:
                         # No (valid) token on this POST -- fall back to trusting an
                         # already-authenticated session, since the mcp SDK never
                         # gives clients a way to resend the token here.
-                        profile = self._session_profiles.get(session_id)
+                        resolved = self._session_profiles.get(session_id)
 
-                if profile is None:
+                if resolved is None:
                     body = b'{"error":{"code":"auth_required","message":"Invalid or missing MCP token"}}'
                     await send({
                         "type": "http.response.start",
@@ -354,35 +360,39 @@ class AppAuthMiddleware:
                     await send({"type": "http.response.body", "body": body, "more_body": False})
                     return
 
+                profile, is_admin = resolved
+
                 send_for_app = send
                 new_session_ids: List[str] = []
                 if path.startswith("/sse"):
                     # This is the GET /sse connection: watch its outgoing body for the
                     # SDK's "endpoint" event, which is the only place session_id is
                     # ever minted, and remember which profile authenticated it.
-                    async def _capturing_send(message, _send=send, _profile=profile, _ids=new_session_ids):
+                    async def _capturing_send(message, _send=send, _info=(profile, is_admin), _ids=new_session_ids):
                         if message.get("type") == "http.response.body":
                             match = re.search(rb"session_id=([0-9a-fA-F]{32})", message.get("body", b""))
                             if match:
                                 sid = match.group(1).decode("ascii")
-                                self._session_profiles[sid] = _profile
+                                self._session_profiles[sid] = _info
                                 _ids.append(sid)
                         await _send(message)
 
                     send_for_app = _capturing_send
 
                 token_t = current_profile.set(profile)
+                token_admin = current_is_admin.set(is_admin)
                 try:
                     await self.app(scope, receive, send_for_app)
                     return
                 finally:
                     current_profile.reset(token_t)
+                    current_is_admin.reset(token_admin)
                     for sid in new_session_ids:
                         self._session_profiles.pop(sid, None)
 
         await self.app(scope, receive, send)
 
-    def _resolve_profile(self, token: Optional[str]) -> Optional[str]:
+    def _resolve_profile(self, token: Optional[str]) -> Optional[Tuple[str, bool]]:
         if not token:
             return None
         try:
@@ -393,14 +403,17 @@ class AppAuthMiddleware:
                         mcp_tokens_store.touch_last_used(conn, row["id"])
                         user = users_store.get_user(conn, row["user_id"])
                         if user is not None and user["is_active"]:
-                            return user["username"]
+                            return user["username"], bool(user["is_admin"])
         except Exception:
             logger.exception("DB-backed MCP token lookup failed; falling back to .env token map")
 
         # Legacy fallback: reload the .env-scraped token map fresh each time,
         # exactly as the middleware it replaces did.
         self.token_map = load_token_profile_map()
-        return self.token_map.get(token)
+        name = self.token_map.get(token)
+        if name:
+            return name, False
+        return None
 
 
 def build_http_app():
@@ -810,6 +823,7 @@ def sync_profile(profile: str) -> Dict[str, Any]:
     with auth errors) on every scheduler tick even though no one asked for it
     to exist.
     """
+    profile = _effective_profile(profile)
     lock = _get_profile_lock(profile)
     if not lock.acquire(blocking=False):
         return {"profile": profile, "status": "skipped", "reason": "sync already in progress"}
@@ -997,6 +1011,7 @@ def full_download_profile(profile: str) -> Dict[str, Any]:
     """Runs full_download_account for every one of a profile's accounts, guarded by the same
     per-profile lock/stop-event as sync_profile. Same DB-vs-legacy resolution as sync_profile --
     see _db_integration_accounts."""
+    profile = _effective_profile(profile)
     lock = _get_profile_lock(profile)
     if not lock.acquire(blocking=False):
         return {"profile": profile, "status": "skipped", "reason": "sync already in progress"}
@@ -1070,6 +1085,7 @@ def full_download_all_profiles() -> Dict[str, Any]:
 
 def _start_full_download(profile: str) -> Dict[str, Any]:
     """Kicks off a full-mailbox download in a background thread and returns immediately."""
+    profile = _effective_profile(profile)
     if profile.strip().lower() == "all":
         profiles = list_profile_names()
         if _all_sync_lock.locked() or all(_get_profile_lock(p).locked() for p in profiles):
@@ -1077,7 +1093,6 @@ def _start_full_download(profile: str) -> Dict[str, Any]:
         _start_background(full_download_all_profiles)
         return {"status": "started", "profile": "all"}
     else:
-        profile = _effective_profile(profile)
         lock = _get_profile_lock(profile)
         if lock.locked():
             return {"status": "skipped", "reason": "sync already in progress", "profile": profile}
@@ -1286,6 +1301,7 @@ def _dashboard_status(profile_names: Optional[List[str]] = None) -> Dict[str, An
 
 def _start_sync(profile: str) -> Dict[str, Any]:
     """Kicks off a sync in a background thread and returns immediately (does not wait for it)."""
+    profile = _effective_profile(profile)
     if profile.strip().lower() == "all":
         profiles = list_profile_names()
         if _all_sync_lock.locked() or all(_get_profile_lock(p).locked() for p in profiles):
@@ -1298,7 +1314,6 @@ def _start_sync(profile: str) -> Dict[str, Any]:
         _start_background(sync_all_profiles)
         return {"status": "started", "profile": "all", "profiles": profiles}
 
-    profile = _effective_profile(profile)
     lock = _get_profile_lock(profile)
     if lock.locked():
         return {"status": "skipped", "reason": "sync already in progress", "profile": profile}
@@ -1308,7 +1323,8 @@ def _start_sync(profile: str) -> Dict[str, Any]:
 
 def _stop_sync(profile: str) -> Dict[str, Any]:
     """Requests a cooperative stop of any in-progress sync for the given profile(s)."""
-    names = list_profile_names() if profile.strip().lower() == "all" else [_effective_profile(profile)]
+    profile = _effective_profile(profile)
+    names = list_profile_names() if profile.strip().lower() == "all" else [profile]
     for name in names:
         _get_stop_event(name).set()
     return {"status": "stop_requested", "profile": profile}
@@ -1457,7 +1473,8 @@ def trigger_download(profile: str = "default") -> Dict[str, Any]:
     to poll for sync progress and completion.
 
     :param profile: A specific profile name (default: "default"), or "all" to sync every
-                     configured profile under profiles/.
+                     configured profile under profiles/. When authenticated with a profile-scoped
+                     token, "all" and any other profile names resolve to the caller's mapped profile.
     :return: A dictionary indicating whether the sync was started or skipped.
     """
     return _start_sync(profile)
@@ -1470,8 +1487,18 @@ def get_last_download_time(profile: str = "default") -> Dict[str, Any]:
     in a profile, so callers can judge how fresh fetch_and_process_unread's cached results are.
 
     :param profile: A specific profile name (default: "default"), or "all" for every profile.
-    :return: A dictionary of per-account last-sync summaries (or None if never synced).
+                     When authenticated with a profile-scoped token, "all" and any other profile
+                     names resolve to the caller's mapped profile.
+    :return: A dictionary of per-account last-sync summaries (or None if never synced). Email counts
+             per account include:
+             - total: total cached messages across all levels and untriaged archives
+             - level_0: noise messages filtered without classification
+             - level_1: low-priority messages classified by triage model
+             - level_2: high-priority messages summarized by premium model
+             - pending_triage: unread messages downloaded and waiting for background classification
+             - archived_untriaged: historical mailbox archive rows stored untriaged (not awaiting triage)
     """
+    profile = _effective_profile(profile)
     if profile.strip().lower() == "all":
         return {"profiles": {name: _profile_status(name) for name in list_profile_names()}}
     return _profile_status(profile)

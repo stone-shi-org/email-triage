@@ -449,23 +449,33 @@ class EmailDB:
 
     def get_email_counts(self, account: Optional[str] = None) -> Dict[str, int]:
         """Aggregate cached-email counts by triage level, optionally scoped to one account."""
-        counts = {"total": 0, "level_0": 0, "level_1": 0, "level_2": 0, "pending_triage": 0}
+        counts = {
+            "total": 0,
+            "level_0": 0,
+            "level_1": 0,
+            "level_2": 0,
+            "pending_triage": 0,
+            "archived_untriaged": 0,
+        }
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                query = "SELECT triage_level, COUNT(*) FROM email_cache"
+                query = "SELECT triage_level, is_unread, COUNT(*) FROM email_cache"
                 params: list = []
                 if account:
                     query += " WHERE account = ?"
                     params.append(account)
-                query += " GROUP BY triage_level"
+                query += " GROUP BY triage_level, is_unread"
                 cursor.execute(query, params)
-                for level, cnt in cursor.fetchall():
+                for level, is_unread, cnt in cursor.fetchall():
                     counts["total"] += cnt
                     if level is None:
-                        counts["pending_triage"] = cnt
+                        if is_unread == 1:
+                            counts["pending_triage"] += cnt
+                        else:
+                            counts["archived_untriaged"] += cnt
                     elif level in (0, 1, 2):
-                        counts[f"level_{level}"] = cnt
+                        counts[f"level_{level}"] += cnt
             return counts
         except Exception as e:
             logger.error("Failed to get email counts for %s: %s", account or "all accounts", e)

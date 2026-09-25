@@ -57,6 +57,7 @@ def test_valid_db_token_sets_profile_and_passes_through(app_db):
 
     async def inner_app(scope, receive, send):
         captured["profile"] = mcp_server.current_profile.get()
+        captured["is_admin"] = mcp_server.current_is_admin.get()
         await send({"type": "http.response.start", "status": 200, "headers": []})
         await send({"type": "http.response.body", "body": b"ok", "more_body": False})
 
@@ -64,6 +65,29 @@ def test_valid_db_token_sets_profile_and_passes_through(app_db):
     sent = run_middleware(middleware, _make_scope(token=raw))
     assert sent[0]["status"] == 200
     assert captured["profile"] == "bob"
+    assert captured["is_admin"] is False
+
+
+def test_admin_db_token_sets_admin_flag(app_db):
+    with appdb.get_conn(app_db) as conn:
+        user = us.create_user(
+            conn, username="alice", password="a_long_enough_password", is_admin=True, must_change_password=False
+        )
+        raw, _row = mt.create_token(conn, user["id"])
+
+    captured = {}
+
+    async def inner_app(scope, receive, send):
+        captured["profile"] = mcp_server.current_profile.get()
+        captured["is_admin"] = mcp_server.current_is_admin.get()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok", "more_body": False})
+
+    middleware = mcp_server.AppAuthMiddleware(inner_app, token_map={})
+    sent = run_middleware(middleware, _make_scope(token=raw))
+    assert sent[0]["status"] == 200
+    assert captured["profile"] == "alice"
+    assert captured["is_admin"] is True
 
 
 def test_revoked_db_token_without_legacy_fallback_401s(app_db):
