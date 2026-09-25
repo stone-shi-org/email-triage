@@ -160,6 +160,26 @@ from starlette.requests import Request
 # ContextVar to store the authenticated profile name for the current request
 current_profile = contextvars.ContextVar("current_profile", default="default")
 
+
+def _effective_profile(profile_name: str) -> str:
+    """The profile a request actually acts on: the token-mapped one when the
+    request carries a profile-scoped token, else the name the caller passed.
+    Mirrors get_resources()' own override, so code that keys state by profile
+    name (per-profile locks, stop events, sync threads) agrees with the
+    settings get_resources() loads -- ET-3."""
+    mapped = current_profile.get("default")
+    return mapped if mapped != "default" else profile_name
+
+
+def _start_background(target, *args) -> None:
+    """Runs target(*args) on a daemon thread *inside a copy of the caller's
+    contextvars*. threading.Thread does not inherit contextvars, so without the
+    copy a background sync runs with current_profile == "default" and
+    get_resources() silently loads the (usually unconfigured) default profile
+    instead of the token's -- the ET-3 regression from ET-2."""
+    ctx = contextvars.copy_context()
+    threading.Thread(target=lambda: ctx.run(target, *args), daemon=True).start()
+
 def load_token_profile_map() -> Dict[str, str]:
     """Scans root .env and all profile .env files to build a token-to-profile map."""
     token_map = {}
@@ -421,8 +441,7 @@ def build_http_app():
 def get_resources(profile_name: str = "default"):
     # Override profile name with the one mapped from the SSE token context
     mapped_profile = current_profile.get("default")
-    if mapped_profile != "default":
-        profile_name = mapped_profile
+    profile_name = _effective_profile(profile_name)
 
     from config import Settings
     profile_settings = Settings.load_for_profile(profile_name)
@@ -1055,13 +1074,14 @@ def _start_full_download(profile: str) -> Dict[str, Any]:
         profiles = list_profile_names()
         if _all_sync_lock.locked() or all(_get_profile_lock(p).locked() for p in profiles):
             return {"status": "skipped", "reason": "sync already in progress", "profile": "all"}
-        threading.Thread(target=full_download_all_profiles, daemon=True).start()
+        _start_background(full_download_all_profiles)
         return {"status": "started", "profile": "all"}
     else:
+        profile = _effective_profile(profile)
         lock = _get_profile_lock(profile)
         if lock.locked():
             return {"status": "skipped", "reason": "sync already in progress", "profile": profile}
-        threading.Thread(target=lambda: full_download_profile(profile), daemon=True).start()
+        _start_background(full_download_profile, profile)
         return {"status": "started", "profile": profile}
 
 
@@ -1099,6 +1119,7 @@ def _resolve_account_metadata(profile: str) -> Optional[List[Dict[str, Any]]]:
 
 def _profile_status(name: str) -> Dict[str, Any]:
     """Current sync status + last-download summary + cached counts for one profile's accounts."""
+    name = _effective_profile(name)
     db, _, profile_settings = get_resources(name)
 
     def _account_entry(account: str) -> Dict[str, Any]:
@@ -1274,19 +1295,20 @@ def _start_sync(profile: str) -> Dict[str, Any]:
                 "profile": "all",
                 "profiles": profiles,
             }
-        threading.Thread(target=sync_all_profiles, daemon=True).start()
+        _start_background(sync_all_profiles)
         return {"status": "started", "profile": "all", "profiles": profiles}
 
+    profile = _effective_profile(profile)
     lock = _get_profile_lock(profile)
     if lock.locked():
         return {"status": "skipped", "reason": "sync already in progress", "profile": profile}
-    threading.Thread(target=lambda: sync_profile(profile), daemon=True).start()
+    _start_background(sync_profile, profile)
     return {"status": "started", "profile": profile}
 
 
 def _stop_sync(profile: str) -> Dict[str, Any]:
     """Requests a cooperative stop of any in-progress sync for the given profile(s)."""
-    names = list_profile_names() if profile.strip().lower() == "all" else [profile]
+    names = list_profile_names() if profile.strip().lower() == "all" else [_effective_profile(profile)]
     for name in names:
         _get_stop_event(name).set()
     return {"status": "stop_requested", "profile": profile}

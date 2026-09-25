@@ -1602,3 +1602,73 @@ class TestLogBufferHelpers:
             test_logger.warning("line %d", i)
 
         assert len(mcp_server._log_buffer) == mcp_server._log_buffer.maxlen
+
+
+class TestTokenMappedProfileInBackgroundSync:
+    """ET-3: a profile-scoped token maps "default" to its own profile. The
+    background sync thread must act on that profile, not on the literal
+    "default" -- threading.Thread does not inherit contextvars."""
+
+    def test_trigger_download_default_syncs_token_mapped_profile(self, monkeypatch):
+        seen = {}
+        done = threading.Event()
+
+        def fake_sync(p):
+            seen["arg"] = p
+            seen["ctx"] = mcp_server.current_profile.get("default")
+            done.set()
+            return {"profile": p, "status": "ok"}
+
+        monkeypatch.setattr(mcp_server, "sync_profile", fake_sync)
+
+        token = mcp_server.current_profile.set("et3-stone")
+        try:
+            result = mcp_server.trigger_download(profile="default")
+        finally:
+            mcp_server.current_profile.reset(token)
+
+        assert result == {"status": "started", "profile": "et3-stone"}
+        assert done.wait(timeout=2)
+        assert seen["arg"] == "et3-stone"
+        # get_resources() inside the thread must still see the token's profile.
+        assert seen["ctx"] == "et3-stone"
+
+    def test_skip_and_running_use_token_mapped_profile_lock(self, monkeypatch):
+        profile = "et3-mapped"
+        lock = mcp_server._get_profile_lock(profile)
+        assert lock.acquire(blocking=False)
+        try:
+            db = MagicMock(spec=EmailDB)
+            db.get_sync_summary.return_value = None
+            db.get_email_counts.return_value = {}
+            settings = MagicMock()
+            settings.gmail_account = "g@test.com"
+            settings.imap_login = "i@test.com"
+            monkeypatch.setattr(mcp_server, "get_resources", lambda p: (db, MagicMock(), settings))
+            monkeypatch.setattr(mcp_server, "_resolve_account_metadata", lambda p: None)
+            monkeypatch.setattr(mcp_server, "sync_profile", MagicMock(side_effect=AssertionError("must not start")))
+
+            token = mcp_server.current_profile.set(profile)
+            try:
+                res = mcp_server.trigger_download(profile="default")
+                status = mcp_server.get_last_download_time(profile="default")
+            finally:
+                mcp_server.current_profile.reset(token)
+
+            assert res["status"] == "skipped"
+            assert res["profile"] == profile
+            assert status["profile"] == profile
+            assert status["running"] is True
+        finally:
+            lock.release()
+
+    def test_unscoped_request_keeps_literal_profile(self, monkeypatch):
+        seen = {}
+        done = threading.Event()
+        monkeypatch.setattr(mcp_server, "sync_profile", lambda p: (seen.setdefault("arg", p), done.set()))
+
+        result = mcp_server.trigger_download(profile="jenny")
+
+        assert result["profile"] == "jenny"
+        assert done.wait(timeout=2)
+        assert seen["arg"] == "jenny"
