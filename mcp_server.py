@@ -12,7 +12,7 @@ import threading
 import itertools
 import collections
 import email.utils
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 
 # 1. Force stderr-only logging before importing other modules
