@@ -49,8 +49,13 @@ class FileTokenSource:
         return None
 
     def save(self, creds: Credentials) -> None:
-        with open(self.token_path, "w") as token_file:
+        import os
+        import tempfile
+        self.token_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", dir=self.token_path.parent, delete=False) as token_file:
             token_file.write(creds.to_json())
+            temp_name = token_file.name
+        os.replace(temp_name, self.token_path)
 
     def interactive_or_fail(self) -> Credentials:
         if not self.credentials_path.exists():

@@ -1,6 +1,7 @@
 import sys
 import logging
 import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -845,20 +846,26 @@ class TestFetchAndProcessUnreadCacheOnly:
 
 class TestTriggerDownloadAndLastDownloadTime:
     def test_trigger_download_single_profile(self, monkeypatch):
-        monkeypatch.setattr(mcp_server, "sync_profile", MagicMock(return_value={"profile": "default", "status": "ok"}))
+        started = threading.Event()
+        monkeypatch.setattr(mcp_server, "sync_profile", lambda profile: started.set())
         monkeypatch.setattr(mcp_server, "sync_all_profiles", MagicMock(side_effect=AssertionError("should not be called")))
 
         result = mcp_server.trigger_download(profile="default")
 
-        assert result["status"] == "ok"
+        assert result["status"] == "started"
+        assert result["profile"] == "default"
+        assert started.wait(timeout=2)
 
     def test_trigger_download_all_profiles(self, monkeypatch):
-        monkeypatch.setattr(mcp_server, "sync_all_profiles", MagicMock(return_value={"profiles": {}}))
+        started = threading.Event()
+        monkeypatch.setattr(mcp_server, "sync_all_profiles", lambda: started.set())
         monkeypatch.setattr(mcp_server, "sync_profile", MagicMock(side_effect=AssertionError("should not be called")))
 
         result = mcp_server.trigger_download(profile="all")
 
+        assert result["status"] == "started"
         assert "profiles" in result
+        assert started.wait(timeout=2)
 
     def test_get_last_download_time_single_profile(self, monkeypatch):
         db = MagicMock(spec=EmailDB)
@@ -885,6 +892,97 @@ class TestTriggerDownloadAndLastDownloadTime:
         result = mcp_server.get_last_download_time(profile="all")
 
         assert set(result["profiles"].keys()) == {"default", "other"}
+
+
+class TestConcurrentTriggerDownload:
+    def test_slow_sync_does_not_block_concurrent_calls(self, monkeypatch):
+        profile = "concurrent-test-profile"
+        sync_started = threading.Event()
+        sync_proceed = threading.Event()
+
+        def slow_sync(p):
+            lock = mcp_server._get_profile_lock(p)
+            if not lock.acquire(blocking=False):
+                return {"profile": p, "status": "skipped", "reason": "sync already in progress"}
+            try:
+                sync_started.set()
+                sync_proceed.wait(timeout=5)
+                return {"profile": p, "status": "ok"}
+            finally:
+                lock.release()
+
+        monkeypatch.setattr(mcp_server, "sync_profile", slow_sync)
+
+        db = MagicMock(spec=EmailDB)
+        db.get_sync_summary.return_value = {"account": "test@example.com"}
+        db.get_email_counts.return_value = {"unread": 0}
+        db.get_unread_emails.return_value = []
+        settings = MagicMock()
+        settings.gmail_account = "test@example.com"
+        settings.imap_login = "imap@example.com"
+        monkeypatch.setattr(mcp_server, "get_resources", lambda p: (db, MagicMock(), settings))
+        monkeypatch.setattr(mcp_server, "_resolve_account_metadata", lambda p: None)
+
+        # 1. trigger_download returns in under 1s with status "started"
+        t0 = time.perf_counter()
+        res1 = mcp_server.trigger_download(profile=profile)
+        elapsed1 = time.perf_counter() - t0
+        assert elapsed1 < 1.0
+        assert res1["status"] == "started"
+        assert res1["profile"] == profile
+        assert sync_started.wait(timeout=2)
+
+        # 2. While slow sync is running, a second trigger_download returns skipped immediately
+        t1 = time.perf_counter()
+        res2 = mcp_server.trigger_download(profile=profile)
+        elapsed2 = time.perf_counter() - t1
+        assert elapsed2 < 1.0
+        assert res2["status"] == "skipped"
+        assert res2["reason"] == "sync already in progress"
+
+        # 3. get_last_download_time shows running: True
+        status = mcp_server.get_last_download_time(profile=profile)
+        assert status["running"] is True
+
+        # 4. Concurrent fetch_and_process_unread completes immediately without blocking
+        unread = mcp_server.fetch_and_process_unread(profile=profile)
+        assert "Total Scanned**: 0" in unread
+
+        # 5. Let slow sync finish
+        sync_proceed.set()
+        time.sleep(0.05)
+
+        status_after = mcp_server.get_last_download_time(profile=profile)
+        assert status_after["running"] is False
+
+    def test_trigger_download_all_skipped_if_already_running(self, monkeypatch):
+        sync_started = threading.Event()
+        sync_proceed = threading.Event()
+
+        def slow_sync_all():
+            if not mcp_server._all_sync_lock.acquire(blocking=False):
+                return {"status": "skipped", "reason": "sync already in progress"}
+            try:
+                sync_started.set()
+                sync_proceed.wait(timeout=5)
+                return {"profiles": {}}
+            finally:
+                mcp_server._all_sync_lock.release()
+
+        monkeypatch.setattr(mcp_server, "sync_all_profiles", slow_sync_all)
+        monkeypatch.setattr(mcp_server, "list_profile_names", lambda: ["default", "stone"])
+
+        res1 = mcp_server.trigger_download(profile="all")
+        assert res1["status"] == "started"
+        assert res1["profile"] == "all"
+        assert sync_started.wait(timeout=2)
+
+        res2 = mcp_server.trigger_download(profile="all")
+        assert res2["status"] == "skipped"
+        assert res2["reason"] == "sync already in progress"
+
+        sync_proceed.set()
+        time.sleep(0.05)
 
 
 class TestFetchFullEmail:

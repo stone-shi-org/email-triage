@@ -121,16 +121,15 @@ Recommended tool-call ordering: call a read-only/status tool before any mutating
 - Read-only / status first: fetch_and_process_unread (cache-only -- never hits Gmail/IMAP \
 directly; call trigger_download or check get_last_download_time first if the cache might be \
 stale), get_last_download_time, search_emails (live mailbox search), fetch_full_email.
-- Mutating (change mailbox/cache state): trigger_download (kicks off a background sync), \
+- Mutating (change mailbox/cache state): trigger_download (starts a background sync and returns immediately; poll get_last_download_time for completion), \
 mark_emails_as_read, create_new_draft, create_draft_reply, and send_email_reply -- the last is \
 irreversible (actually sends mail) and should be used with the most caution.
 
 Cross-cutting caveats:
 - Most tools take a `profile` argument identifying which mailbox/account to operate on; omitting \
 it uses the "default" profile.
-- fetch_and_process_unread never triggers a live download itself -- pair it with \
-trigger_download/get_last_download_time if you need fresh data rather than whatever was last \
-synced.
+- fetch_and_process_unread never triggers a live download itself -- call trigger_download to start \
+a background sync and poll get_last_download_time until completion if you need fresh data rather than whatever was last synced.
 
 For per-tool parameter/return details, load individual tool schemas on demand after reading this \
 overview."""
@@ -463,6 +462,7 @@ def filter_emails_by_days(emails: List[Dict[str, Any]], days: int) -> List[Dict[
 
 _sync_locks: Dict[str, threading.Lock] = {}
 _sync_locks_guard = threading.Lock()
+_all_sync_lock = threading.Lock()
 
 _stop_events: Dict[str, threading.Event] = {}
 _stop_events_guard = threading.Lock()
@@ -864,7 +864,16 @@ def sync_profile(profile: str) -> Dict[str, Any]:
 
 def sync_all_profiles() -> Dict[str, Any]:
     """Runs sync_profile for every configured profile under profiles/."""
-    return {"profiles": {name: sync_profile(name) for name in list_profile_names()}}
+    if not _all_sync_lock.acquire(blocking=False):
+        return {
+            "status": "skipped",
+            "reason": "sync already in progress",
+            "profiles": {name: {"profile": name, "status": "skipped", "reason": "sync already in progress"} for name in list_profile_names()}
+        }
+    try:
+        return {"profiles": {name: sync_profile(name) for name in list_profile_names()}}
+    finally:
+        _all_sync_lock.release()
 
 
 # =====================================================================
@@ -1028,16 +1037,32 @@ def full_download_profile(profile: str) -> Dict[str, Any]:
 
 def full_download_all_profiles() -> Dict[str, Any]:
     """Runs full_download_profile for every configured profile under profiles/."""
-    return {"profiles": {name: full_download_profile(name) for name in list_profile_names()}}
+    if not _all_sync_lock.acquire(blocking=False):
+        return {
+            "status": "skipped",
+            "reason": "sync already in progress",
+            "profiles": {name: {"profile": name, "status": "skipped", "reason": "sync already in progress"} for name in list_profile_names()}
+        }
+    try:
+        return {"profiles": {name: full_download_profile(name) for name in list_profile_names()}}
+    finally:
+        _all_sync_lock.release()
 
 
 def _start_full_download(profile: str) -> Dict[str, Any]:
     """Kicks off a full-mailbox download in a background thread and returns immediately."""
     if profile.strip().lower() == "all":
+        profiles = list_profile_names()
+        if _all_sync_lock.locked() or all(_get_profile_lock(p).locked() for p in profiles):
+            return {"status": "skipped", "reason": "sync already in progress", "profile": "all"}
         threading.Thread(target=full_download_all_profiles, daemon=True).start()
+        return {"status": "started", "profile": "all"}
     else:
+        lock = _get_profile_lock(profile)
+        if lock.locked():
+            return {"status": "skipped", "reason": "sync already in progress", "profile": profile}
         threading.Thread(target=lambda: full_download_profile(profile), daemon=True).start()
-    return {"status": "started", "profile": profile}
+        return {"status": "started", "profile": profile}
 
 
 def _is_configured(profile_settings: Any) -> bool:
@@ -1241,9 +1266,21 @@ def _dashboard_status(profile_names: Optional[List[str]] = None) -> Dict[str, An
 def _start_sync(profile: str) -> Dict[str, Any]:
     """Kicks off a sync in a background thread and returns immediately (does not wait for it)."""
     if profile.strip().lower() == "all":
+        profiles = list_profile_names()
+        if _all_sync_lock.locked() or all(_get_profile_lock(p).locked() for p in profiles):
+            return {
+                "status": "skipped",
+                "reason": "sync already in progress",
+                "profile": "all",
+                "profiles": profiles,
+            }
         threading.Thread(target=sync_all_profiles, daemon=True).start()
-    else:
-        threading.Thread(target=lambda: sync_profile(profile), daemon=True).start()
+        return {"status": "started", "profile": "all", "profiles": profiles}
+
+    lock = _get_profile_lock(profile)
+    if lock.locked():
+        return {"status": "skipped", "reason": "sync already in progress", "profile": profile}
+    threading.Thread(target=lambda: sync_profile(profile), daemon=True).start()
     return {"status": "started", "profile": profile}
 
 
@@ -1389,19 +1426,19 @@ def fetch_and_process_unread(max_per_source: int = 5, days: int = 7, profile: st
 @mcp.tool()
 def trigger_download(profile: str = "default") -> Dict[str, Any]:
     """
-    Manually triggers an immediate mailbox sync: downloads currently-unread mail (including full
-    body), reconciles previously-cached-unread messages that have since been read elsewhere, and
-    triages anything not yet classified, caching the results. This normally happens automatically
-    on the background scheduler's interval; use this tool to force a refresh right now.
+    Manually triggers an immediate mailbox sync in the background: downloads currently-unread mail
+    (including full body), reconciles previously-cached-unread messages that have since been read
+    elsewhere, and triages anything not yet classified, caching the results.
+
+    Returns immediately with {"status": "started", ...} (or {"status": "skipped", "reason": "sync already in progress"}
+    if a sync is already running). Does not block waiting for the sync to finish. Call get_last_download_time
+    to poll for sync progress and completion.
 
     :param profile: A specific profile name (default: "default"), or "all" to sync every
-                     configured profile under profiles/ sequentially.
-    :return: A dictionary summarizing the sync per account (counts downloaded/reconciled/triaged),
-             or a "skipped" status if a sync for that profile is already in progress.
+                     configured profile under profiles/.
+    :return: A dictionary indicating whether the sync was started or skipped.
     """
-    if profile.strip().lower() == "all":
-        return sync_all_profiles()
-    return sync_profile(profile)
+    return _start_sync(profile)
 
 
 @mcp.tool()
