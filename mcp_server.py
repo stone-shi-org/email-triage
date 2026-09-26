@@ -1124,6 +1124,8 @@ def _resolve_account_metadata(profile: str) -> Optional[List[Dict[str, Any]]]:
                 {
                     "integration_id": r["id"], "provider": r["provider"], "account": r["cache_account_key"],
                     "label": r["account_label"] or r["cache_account_key"],
+                    "triage_enabled": bool(r["triage_enabled"]) if "triage_enabled" in r.keys() else True,
+                    "archive_enabled": bool(r["archive_enabled"]) if "archive_enabled" in r.keys() else True,
                 }
                 for r in rows
             ]
@@ -1384,6 +1386,17 @@ def mark_emails_as_read(
 
 
 
+def _format_unread_id_suffix(item: Dict[str, Any]) -> str:
+    mid = item.get("message_id") or ""
+    sid = item.get("source_id")
+    suffix = ""
+    if mid:
+        suffix += f" [ID: {mid}]"
+    if sid and sid != mid:
+        suffix += f" (source_id: {sid})"
+    return suffix
+
+
 @mcp.tool()
 def fetch_and_process_unread(max_per_source: int = 5, days: int = 7, profile: str = "default") -> str:
     """
@@ -1400,6 +1413,7 @@ def fetch_and_process_unread(max_per_source: int = 5, days: int = 7, profile: st
     :param profile: Dynamic profile environment to load (default: "default").
     :return: A formatted string summary of currently-unread, cached triage results.
     """
+    profile = _effective_profile(profile)
     db, engine, settings = get_resources(profile)
     stats = {
         "scanned": 0,
@@ -1411,7 +1425,22 @@ def fetch_and_process_unread(max_per_source: int = 5, days: int = 7, profile: st
     run_results: List[Dict[str, Any]] = []
     pending: List[Dict[str, Any]] = []
 
-    for account in (settings.gmail_account, settings.imap_login):
+    accounts_meta = _resolve_account_metadata(profile)
+    if accounts_meta is not None:
+        triage_accounts = [m["account"] for m in accounts_meta if m.get("triage_enabled", True)]
+        accounts = triage_accounts if triage_accounts else [settings.gmail_account, settings.imap_login]
+    else:
+        accounts = [settings.gmail_account, settings.imap_login]
+
+    seen_accounts = set()
+    deduped_accounts = []
+    for a in accounts:
+        if a and a not in seen_accounts:
+            seen_accounts.add(a)
+            deduped_accounts.append(a)
+    accounts = deduped_accounts if deduped_accounts else accounts
+
+    for account in accounts:
         rows = db.get_unread_emails(account=account)
         rows_for_filter = [{**r, "date": r.get("date_str", "")} for r in rows]
         rows_for_filter = filter_emails_by_days(rows_for_filter, days)[:max_per_source]
@@ -1432,7 +1461,7 @@ def fetch_and_process_unread(max_per_source: int = 5, days: int = 7, profile: st
 
     # A message only counts as "shown" once it's actually rendered to the user below -- pending
     # (not-yet-triaged) rows don't count, since auto-mark-read also requires a completed triage.
-    db.increment_display_count([r["message_id"] for r in run_results])
+    db.increment_display_count([r["message_id"] for r in run_results if r.get("message_id")])
 
     # Render detailed textual overview for the agent
     lines = [
@@ -1447,8 +1476,9 @@ def fetch_and_process_unread(max_per_source: int = 5, days: int = 7, profile: st
 
     for item in run_results:
         tag = (item.get("tag") or "untagged").upper()
+        mid_suffix = _format_unread_id_suffix(item)
         lines.append(
-            f"- **[{tag}]** *{item.get('sender')}* - **{item.get('subject')}** (Level {item.get('triage_level')})"
+            f"- **[{tag}]** *{item.get('sender')}* - **{item.get('subject')}** (Level {item.get('triage_level')}){mid_suffix}"
         )
         if item.get("level_2_summary"):
             lines.append(f"  *Summary:* {item['level_2_summary']}")
@@ -1456,7 +1486,8 @@ def fetch_and_process_unread(max_per_source: int = 5, days: int = 7, profile: st
     if pending:
         lines.append("\n### Pending Background Triage (downloaded, not yet classified):\n")
         for item in pending:
-            lines.append(f"- *{item.get('sender')}* - **{item.get('subject')}**")
+            mid_suffix = _format_unread_id_suffix(item)
+            lines.append(f"- *{item.get('sender')}* - **{item.get('subject')}**{mid_suffix}")
 
     return "\n".join(lines)
 

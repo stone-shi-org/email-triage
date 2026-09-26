@@ -843,6 +843,137 @@ class TestFetchAndProcessUnreadCacheOnly:
 
         db.increment_display_count.assert_called_once_with([])
 
+    def test_includes_message_id_and_source_id_in_output(self, monkeypatch):
+        db = MagicMock(spec=EmailDB)
+        triaged_row_with_source = {
+            "message_id": "<t1@test.com>", "source_id": "gmail-123", "sender": "s1@x.com", "subject": "Subj1",
+            "date_str": "2026-07-20", "triage_level": 2, "tag": "vip", "level_2_summary": "Summary 1",
+        }
+        triaged_row_same_source = {
+            "message_id": "<t2@test.com>", "source_id": "<t2@test.com>", "sender": "s2@x.com", "subject": "Subj2",
+            "date_str": "2026-07-20", "triage_level": 1, "tag": "info",
+        }
+        pending_row = {
+            "message_id": "<p1@test.com>", "source_id": "imap-456", "sender": "s3@x.com", "subject": "Pending Subj",
+            "date_str": "2026-07-20", "triage_level": None, "tag": None,
+        }
+
+        def fake_get_unread_emails(account=None, limit=None):
+            return [triaged_row_with_source, triaged_row_same_source, pending_row] if account == "gmail@test.com" else []
+
+        db.get_unread_emails.side_effect = fake_get_unread_emails
+        engine = MagicMock(spec=EmailTriageEngine)
+        settings = MagicMock()
+        settings.gmail_account = "gmail@test.com"
+        settings.imap_login = "imap@test.com"
+        monkeypatch.setattr(mcp_server, "get_resources", lambda profile: (db, engine, settings))
+
+        result = mcp_server.fetch_and_process_unread(max_per_source=5, days=30, profile="default")
+
+        # Every item (triaged and pending) includes its message ID
+        assert "[ID: <t1@test.com>]" in result
+        assert "(source_id: gmail-123)" in result
+        assert "[ID: <t2@test.com>]" in result
+        assert "(source_id: <t2@test.com>)" not in result  # omitted when equal to message_id
+        assert "[ID: <p1@test.com>]" in result
+        assert "(source_id: imap-456)" in result
+
+    def test_db_multi_account_integrations(self, monkeypatch):
+        db = MagicMock(spec=EmailDB)
+        rows_by_account = {
+            "g1@test.com": [{
+                "message_id": "<g1-msg@test.com>", "source_id": "g1-src", "sender": "s1@x.com", "subject": "G1 Subj",
+                "date_str": "2026-07-20", "triage_level": 2, "tag": "vip",
+            }],
+            "g2@test.com": [{
+                "message_id": "<g2-msg@test.com>", "source_id": "g2-src", "sender": "s2@x.com", "subject": "G2 Subj",
+                "date_str": "2026-07-20", "triage_level": 1, "tag": "low",
+            }],
+            "zoho@test.com": [{
+                "message_id": "<zoho-msg@test.com>", "source_id": "zoho-src", "sender": "s3@x.com", "subject": "Zoho Subj",
+                "date_str": "2026-07-20", "triage_level": None, "tag": None,
+            }],
+        }
+        db.get_unread_emails.side_effect = lambda account=None, limit=None: rows_by_account.get(account, [])
+        engine = MagicMock(spec=EmailTriageEngine)
+        settings = MagicMock()
+        settings.gmail_account = "legacy@test.com"
+        settings.imap_login = "legacy_imap@test.com"
+        monkeypatch.setattr(mcp_server, "get_resources", lambda profile: (db, engine, settings))
+        monkeypatch.setattr(mcp_server, "_resolve_account_metadata", lambda profile: [
+            {"account": "g1@test.com", "triage_enabled": True},
+            {"account": "g2@test.com", "triage_enabled": True},
+            {"account": "zoho@test.com", "triage_enabled": True},
+        ])
+
+        result = mcp_server.fetch_and_process_unread(max_per_source=5, days=30, profile="stone")
+
+        assert "Total Scanned**: 3" in result
+        assert "[ID: <g1-msg@test.com>]" in result
+        assert "[ID: <g2-msg@test.com>]" in result
+        assert "[ID: <zoho-msg@test.com>]" in result
+
+    def test_db_user_zero_integrations_falls_back_to_legacy(self, monkeypatch):
+        db = MagicMock(spec=EmailDB)
+        db.get_unread_emails.side_effect = lambda account=None, limit=None: [
+            {"message_id": "<legacy@test.com>", "sender": "s@x.com", "subject": "Legacy Subj",
+             "date_str": "2026-07-20", "triage_level": 0, "tag": "low"}
+        ] if account == "legacy_gmail@test.com" else []
+        engine = MagicMock(spec=EmailTriageEngine)
+        settings = MagicMock()
+        settings.gmail_account = "legacy_gmail@test.com"
+        settings.imap_login = "legacy_imap@test.com"
+        monkeypatch.setattr(mcp_server, "get_resources", lambda profile: (db, engine, settings))
+        monkeypatch.setattr(mcp_server, "_resolve_account_metadata", lambda profile: [])
+
+        result = mcp_server.fetch_and_process_unread(max_per_source=5, days=30, profile="default")
+
+        assert "[ID: <legacy@test.com>]" in result
+        assert "Legacy Subj" in result
+
+    def test_skips_disabled_triage_integrations(self, monkeypatch):
+        db = MagicMock(spec=EmailDB)
+        queried_accounts = []
+
+        def fake_get_unread(account=None, limit=None):
+            queried_accounts.append(account)
+            return []
+
+        db.get_unread_emails.side_effect = fake_get_unread
+        engine = MagicMock(spec=EmailTriageEngine)
+        settings = MagicMock()
+        settings.gmail_account = "legacy@test.com"
+        settings.imap_login = "legacy_imap@test.com"
+        monkeypatch.setattr(mcp_server, "get_resources", lambda profile: (db, engine, settings))
+        monkeypatch.setattr(mcp_server, "_resolve_account_metadata", lambda profile: [
+            {"account": "enabled@test.com", "triage_enabled": True},
+            {"account": "disabled@test.com", "triage_enabled": False},
+        ])
+
+        mcp_server.fetch_and_process_unread(max_per_source=5, days=30, profile="stone")
+
+        assert queried_accounts == ["enabled@test.com"]
+
+    def test_legacy_profile_without_db(self, monkeypatch):
+        db = MagicMock(spec=EmailDB)
+        queried_accounts = []
+
+        def fake_get_unread(account=None, limit=None):
+            queried_accounts.append(account)
+            return []
+
+        db.get_unread_emails.side_effect = fake_get_unread
+        engine = MagicMock(spec=EmailTriageEngine)
+        settings = MagicMock()
+        settings.gmail_account = "legacy_gmail@test.com"
+        settings.imap_login = "legacy_imap@test.com"
+        monkeypatch.setattr(mcp_server, "get_resources", lambda profile: (db, engine, settings))
+        monkeypatch.setattr(mcp_server, "_resolve_account_metadata", lambda profile: None)
+
+        mcp_server.fetch_and_process_unread(max_per_source=5, days=30, profile="default")
+
+        assert queried_accounts == ["legacy_gmail@test.com", "legacy_imap@test.com"]
+
 
 class TestTriggerDownloadAndLastDownloadTime:
     def test_trigger_download_single_profile(self, monkeypatch):
