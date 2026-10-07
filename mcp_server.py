@@ -119,17 +119,18 @@ calls for already-seen messages are free.
 
 Recommended tool-call ordering: call a read-only/status tool before any mutating tool.
 - Read-only / status first: fetch_and_process_unread (cache-only -- never hits Gmail/IMAP \
-directly; call trigger_download or check get_last_download_time first if the cache might be \
-stale), get_last_download_time, search_emails (live mailbox search), fetch_full_email.
-- Mutating (change mailbox/cache state): trigger_download (starts a background sync and returns immediately; poll get_last_download_time for completion), \
+directly; the cache is refreshed automatically by a background sync, so just call it), \
+get_last_download_time, search_emails (live mailbox search), fetch_full_email.
+- Mutating (change mailbox/cache state): trigger_download (optional, rarely needed: starts a background sync and returns immediately), \
 mark_emails_as_read, create_new_draft, create_draft_reply, and send_email_reply -- the last is \
 irreversible (actually sends mail) and should be used with the most caution.
 
 Cross-cutting caveats:
 - Most tools take a `profile` argument identifying which mailbox/account to operate on; omitting \
 it uses the "default" profile.
-- fetch_and_process_unread never triggers a live download itself -- call trigger_download to start \
-a background sync and poll get_last_download_time until completion if you need fresh data rather than whatever was last synced.
+- fetch_and_process_unread never triggers a live download itself; a periodic background sync keeps \
+the cache fresh, so normally just call it. Only call trigger_download if the user explicitly asks \
+for a refresh or the results are clearly missing mail they expect.
 
 For per-tool parameter/return details, load individual tool schemas on demand after reading this \
 overview."""
@@ -1402,11 +1403,10 @@ def fetch_and_process_unread(max_per_source: int = 5, days: int = 7, profile: st
     """
     Returns triage details/summaries for currently-unread emails FROM THE LOCAL CACHE.
 
-    CRITICAL: This tool no longer calls Gmail/IMAP live. The cache is kept fresh by a periodic
-    background sync job (interval configured via `scheduler` settings), which downloads unread
-    mail (including full body), reconciles read/unread status, and triages new mail. Use
-    `trigger_download` to force an immediate refresh, and `get_last_download_time` to check how
-    stale the cached results might be before trusting this output.
+    Note: this reads the local cache, not Gmail/IMAP live. A periodic background sync job keeps
+    the cache fresh (downloads unread mail, reconciles read/unread, triages new mail), so call this
+    directly -- no need to refresh first. Only use `trigger_download` if the user explicitly asks
+    for a refresh, and `get_last_download_time` only if results look stale or incomplete.
 
     :param max_per_source: Maximum number of cached unread items to return per account source.
     :param days: Only include unread emails received within this number of past days.
@@ -1495,7 +1495,8 @@ def fetch_and_process_unread(max_per_source: int = 5, days: int = 7, profile: st
 @mcp.tool()
 def trigger_download(profile: str = "default") -> Dict[str, Any]:
     """
-    Manually triggers an immediate mailbox sync in the background: downloads currently-unread mail
+    Rarely needed: the background scheduler already syncs periodically. Only call this when the user
+    explicitly asks for a refresh. Manually triggers an immediate mailbox sync in the background: downloads currently-unread mail
     (including full body), reconciles previously-cached-unread messages that have since been read
     elsewhere, and triages anything not yet classified, caching the results.
 
