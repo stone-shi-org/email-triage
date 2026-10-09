@@ -98,7 +98,6 @@ def main() -> None:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content}
                 ],
-                "temperature": 0.0,
                 "include_reasoning": False
             }
             

@@ -114,7 +114,6 @@ def _score_summary_quality(
             {"role": "system", "content": _SUMMARY_JUDGE_SYSTEM},
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0.0,
         "include_reasoning": False,
         "stream": False,
     }

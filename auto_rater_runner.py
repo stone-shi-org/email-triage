@@ -225,7 +225,6 @@ def run_config(config: Dict[str, Any], emails: List[Dict[str, Any]], workspace_d
                             {"role": "system", "content": l2_system},
                             {"role": "user", "content": l2_prompt}
                         ],
-                        "temperature": 0.2,
                         "include_reasoning": False,
                         "stream": False,
                         "max_tokens": MAX_TOKENS_LEVEL_2,
@@ -285,7 +284,6 @@ def run_config(config: Dict[str, Any], emails: List[Dict[str, Any]], workspace_d
                         {"role": "system", "content": l0_audit_system},
                         {"role": "user", "content": l0_audit_prompt}
                     ],
-                    "temperature": 0.0,
                     "include_reasoning": False,
                     "stream": False,
                     "max_tokens": MAX_TOKENS_LEVEL_0_JUDGE,
@@ -426,7 +424,6 @@ def test_llm_reachability(model_name: str, base_url: str, headers: Dict[str, str
             {"role": "user", "content": "Write a detailed paragraph (at least 100 words) explaining what an email triage pipeline does."}
         ],
         "max_tokens": MAX_TOKENS_REACHABILITY_PROBE,
-        "temperature": 0.2,
         "include_reasoning": False,
         # Must match what the real pipeline sends: the proxy streams Server-Sent Events unless
         # streaming is explicitly declined, and resp.json() cannot parse an SSE body.

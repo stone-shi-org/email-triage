@@ -86,7 +86,6 @@ def run_llm_classifier(url: str, api_key: str, model: str, sender: str, subject:
             {"role": "system", "content": system_instruction},
             {"role": "user", "content": prompt}
         ],
-        "temperature": 0.0,
         "include_reasoning": False
     }
     
@@ -149,7 +148,6 @@ def run_llm_judge(judge_url: str, judge_api_key: str, judge_model: str, email: D
             {"role": "system", "content": judge_system},
             {"role": "user", "content": judge_prompt}
         ],
-        "temperature": 0.0,
         "include_reasoning": False
     }
     

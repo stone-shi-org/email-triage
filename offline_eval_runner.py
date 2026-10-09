@@ -119,7 +119,6 @@ def run_baseline_triage(
                         {"role": "system", "content": l2_system},
                         {"role": "user", "content": l2_prompt}
                     ],
-                    "temperature": 0.2,
                     "include_reasoning": False
                 }
                 resp = http_client.post(f"{base_url}/chat/completions", headers=headers, json=l2_payload)
@@ -222,7 +221,6 @@ def run_baseline_triage(
                     {"role": "system", "content": l1_system},
                     {"role": "user", "content": l1_prompt}
                 ],
-                "temperature": 0.0,
                 "include_reasoning": False
             }
             resp = http_client.post(f"{base_url}/chat/completions", headers=headers, json=l1_payload)
@@ -263,7 +261,6 @@ def run_baseline_triage(
                         {"role": "system", "content": l2_system},
                         {"role": "user", "content": l2_prompt}
                     ],
-                    "temperature": 0.2,
                     "include_reasoning": False
                 }
                 resp = http_client.post(f"{base_url}/chat/completions", headers=headers, json=l2_payload)
@@ -322,8 +319,7 @@ def evaluate_summary_quality(
             "messages": [
                 {"role": "system", "content": judge_system},
                 {"role": "user", "content": judge_prompt}
-            ],
-            "temperature": 0.0
+            ]
         }
         resp = http_client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
         resp.raise_for_status()

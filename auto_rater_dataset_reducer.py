@@ -139,8 +139,7 @@ def main() -> None:
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content}
-                ],
-                "temperature": 0.0
+                ]
             }
             
             logger.info("Invoking %s proxy clustering for Level %d...", cluster_model, lvl)

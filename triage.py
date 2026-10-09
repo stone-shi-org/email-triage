@@ -518,7 +518,6 @@ class EmailTriageEngine:
                 {"role": "system", "content": system_instruction},
                 {"role": "user", "content": prompt}
             ],
-            "temperature": 0.0,
             "include_reasoning": False,
             "stream": False,
             "max_tokens": MAX_TOKENS_LEVEL_1,
@@ -596,7 +595,6 @@ class EmailTriageEngine:
                 {"role": "system", "content": system_instruction},
                 {"role": "user", "content": prompt}
             ],
-            "temperature": 0.2,
             "include_reasoning": False,
             "stream": False,
             "max_tokens": MAX_TOKENS_LEVEL_2,
@@ -661,7 +659,6 @@ class EmailTriageEngine:
                 {"role": "system", "content": system_instruction},
                 {"role": "user", "content": prompt}
             ],
-            "temperature": 0.0,
             "include_reasoning": False,
             "stream": False,
             "max_tokens": MAX_TOKENS_PREMIUM_ESCALATION,

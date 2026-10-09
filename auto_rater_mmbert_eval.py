@@ -80,7 +80,6 @@ def judge_is_noise(
             {"role": "system", "content": audit_system},
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0.0,
         "include_reasoning": False,
     }
     resp = http_client.post(f"{base_url}/chat/completions", headers=headers, json=payload)

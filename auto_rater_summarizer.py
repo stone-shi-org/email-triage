@@ -219,7 +219,6 @@ def main() -> None:
                             {"role": "system", "content": judge_system},
                             {"role": "user", "content": judge_prompt}
                         ],
-                        "temperature": 0.0,
                         "include_reasoning": False,
                         # Must match what the rest of the suite sends: the proxy streams Server-Sent
                         # Events unless streaming is explicitly declined, and resp.json() cannot
