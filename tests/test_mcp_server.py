@@ -1914,3 +1914,137 @@ class TestTokenMappedProfileInBackgroundSync:
         assert res["profile"] == "all"
         assert done.wait(timeout=2)
         assert called.get("all") is True
+
+
+class TestNotifiedMCPToolsAndDeduplication:
+    """Acceptance tests for ET-7: per-consumer 'notified' flag exposed as MCP tools
+    and fetch_and_process_unread filtering/header reporting."""
+
+    @pytest.fixture
+    def real_db_env(self, tmp_path, monkeypatch):
+        settings = MagicMock()
+        settings.workspace_dir = tmp_path
+        settings.gmail_account = "stone@gmail.com"
+        settings.imap_login = "stone@zoho.com"
+        settings.triage = MagicMock()
+        settings.triage.notified_retention_days = 14
+
+        db = EmailDB(db_path=tmp_path / "email_cache.db", settings_instance=settings)
+        engine = MagicMock()
+        monkeypatch.setattr(mcp_server, "get_resources", lambda profile="default": (db, engine, settings))
+        monkeypatch.setattr(mcp_server, "_resolve_account_metadata", lambda profile: None)
+        return db, settings
+
+    def _seed_unread(
+        self,
+        db: EmailDB,
+        message_id: str,
+        subject: str,
+        level: int = 2,
+        source_id: str = "",
+        summary: str = "- Action needed by Friday.",
+    ):
+        db.upsert_email_metadata(
+            message_id=message_id,
+            account="stone@gmail.com",
+            sender="Avery Dokka <avery@kirklandlandscapes.com>",
+            subject=subject,
+            date_str="Sun, 01 Nov 2026 10:00:00 +0000",
+            snippet=" snippet ",
+            is_unread=True,
+            source_id=source_id or None,
+        )
+        db.save_triage_result(
+            message_id=message_id,
+            account="stone@gmail.com",
+            sender="Avery Dokka <avery@kirklandlandscapes.com>",
+            subject=subject,
+            date_str="Sun, 01 Nov 2026 10:00:00 +0000",
+            level_0_status="passed" if level > 0 else "filtered",
+            level_1_status="important" if level == 2 else "unimportant",
+            level_2_summary=summary if level == 2 else None,
+            triage_level=level,
+            tag="personal" if level == 2 else ("notification" if level == 1 else "low"),
+        )
+
+    def test_mark_notified_consumer_isolation_and_exclude_notified(self, real_db_env):
+        db, _ = real_db_env
+        mid_1 = "<LV9PR15MB6903599DF0113DA022D19FF3AF6E2@kirkland>"
+        mid_2 = "<msg-two@kirkland>"
+        self._seed_unread(db, mid_1, "Re: Service Request - Kirkland Landscapes", level=2, source_id="src-1")
+        self._seed_unread(db, mid_2, "Invoice #402", level=2, source_id="src-2")
+
+        # Mark mid_1 notified for consumer "A"
+        mark_res = mcp_server.mark_notified([mid_1], consumer="A", profile="stone")
+        assert mark_res["marked_count"] == 1
+        assert mark_res["already_notified_count"] == 0
+
+        # Calling mark_notified twice is a no-op
+        mark_again = mcp_server.mark_notified([mid_1], consumer="A", profile="stone")
+        assert mark_again["marked_count"] == 0
+        assert mark_again["already_notified_count"] == 1
+
+        # Mailbox/cache read/unread state is unchanged after mark_notified
+        assert db.get_cached_result(mid_1)["is_unread"] == 1
+
+        # Fetching with consumer="A", exclude_notified=True leaves out mid_1, keeps mid_2,
+        # and reports "(1 already notified)" in the header counts.
+        out_a = mcp_server.fetch_and_process_unread(
+            days=7, max_per_source=50, profile="stone", consumer="A", exclude_notified=True
+        )
+        assert mid_1 not in out_a
+        assert mid_2 in out_a
+        assert "- **Level 2 (Premium Summarized & Flagged)**: 2 (1 already notified)" in out_a
+        assert "- **Total Scanned**: 2 (1 already notified)" in out_a
+
+        # Calling with consumer="B" still returns mid_1
+        out_b = mcp_server.fetch_and_process_unread(
+            days=7, max_per_source=50, profile="stone", consumer="B", exclude_notified=True
+        )
+        assert mid_1 in out_b
+        assert mid_2 in out_b
+
+    def test_consumer_without_exclude_includes_notified_status_on_every_item(self, real_db_env):
+        db, _ = real_db_env
+        mid_1 = "<m1@test.com>"
+        mid_2 = "<m2@test.com>"
+        self._seed_unread(db, mid_1, "Alerted item", level=2, source_id="src-m1")
+        self._seed_unread(db, mid_2, "Fresh item", level=2, source_id="src-m2")
+
+        # Mark by source_id
+        mcp_server.mark_notified(["src-m1"], consumer="pa-important-emails", profile="stone")
+
+        out = mcp_server.fetch_and_process_unread(
+            days=7, max_per_source=50, profile="stone", consumer="pa-important-emails", exclude_notified=False
+        )
+        assert f"[ID: {mid_1}] (source_id: src-m1) [notified: True, notified_at: " in out
+        assert f"[ID: {mid_2}] (source_id: src-m2) [notified: False, notified_at: None]" in out
+
+    def test_unmark_and_list_notified_tools(self, real_db_env):
+        db, _ = real_db_env
+        mid = "<debug-1@test.com>"
+        self._seed_unread(db, mid, "Debug subject", level=2, source_id="src-dbg")
+
+        mcp_server.mark_notified(["src-dbg"], consumer="pa-digest", profile="stone")
+        listed = mcp_server.list_notified(consumer="pa-digest", profile="stone", since_days=7)
+        assert listed["count"] == 1
+        assert listed["items"][0]["message_id"] == mid
+
+        unmarked = mcp_server.unmark_notified([mid], consumer="pa-digest", profile="stone")
+        assert unmarked["unmarked_count"] == 1
+        assert mcp_server.list_notified(consumer="pa-digest", profile="stone")["count"] == 0
+
+    def test_min_level_filter_omits_lower_levels_from_item_list(self, real_db_env):
+        db, _ = real_db_env
+        self._seed_unread(db, "<l0@test.com>", "Noise promo", level=0)
+        self._seed_unread(db, "<l1@test.com>", "Low priority", level=1)
+        self._seed_unread(db, "<l2@test.com>", "Critical alert", level=2)
+
+        out = mcp_server.fetch_and_process_unread(
+            days=7, max_per_source=50, profile="stone", min_level=2
+        )
+        assert "<l2@test.com>" in out
+        assert "<l1@test.com>" not in out
+        assert "<l0@test.com>" not in out
+        assert "- **Total Scanned**: 3" in out
+        assert "- **Level 2 (Premium Summarized & Flagged)**: 1" in out

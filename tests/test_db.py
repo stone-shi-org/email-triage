@@ -670,3 +670,126 @@ class TestEmailDBBackfillIntegration:
 
     def test_no_matching_rows_returns_zero(self, db):
         assert db.backfill_integration("nobody@test.com", integration_id=1, provider="imap") == 0
+
+
+class TestEmailDBNotifications:
+    def test_mark_notified_idempotent_and_preserves_unread_state(self, db):
+        db.upsert_email_metadata(
+            message_id="<msg1@test.com>",
+            account="acct@test.com",
+            sender="alice@test.com",
+            subject="Urgent",
+            is_unread=True,
+            source_id="gmail-hex-1",
+        )
+        res1 = db.mark_notified(["<msg1@test.com>"], consumer="pa-important-emails", profile="stone")
+        assert res1["marked_count"] == 1
+        assert res1["already_notified_count"] == 0
+        assert res1["marked_ids"] == ["<msg1@test.com>"]
+
+        # Marking the same email a second time is a no-op
+        res2 = db.mark_notified(["<msg1@test.com>"], consumer="pa-important-emails", profile="stone")
+        assert res2["marked_count"] == 0
+        assert res2["already_notified_count"] == 1
+        assert res2["already_notified_ids"] == ["<msg1@test.com>"]
+
+        # Mailbox/cache unread state is completely untouched
+        cached = db.get_cached_result("<msg1@test.com>")
+        assert cached["is_unread"] == 1
+
+    def test_mark_notified_accepts_source_id_and_unbracketed_message_id(self, db):
+        db.upsert_email_metadata(
+            message_id="<msg-source@test.com>",
+            account="acct@test.com",
+            sender="bob@test.com",
+            subject="Hello",
+            is_unread=True,
+            source_id="199d0a1b2c3d",
+        )
+        # Mark via source_id
+        res = db.mark_notified(["199d0a1b2c3d"], consumer="alert-a")
+        assert res["marked_ids"] == ["<msg-source@test.com>"]
+        assert "<msg-source@test.com>" in db.get_notified_map("alert-a")
+
+        # Mark via unbracketed Message-ID for another consumer
+        res_b = db.mark_notified(["msg-source@test.com"], consumer="alert-b")
+        assert res_b["marked_ids"] == ["<msg-source@test.com>"]
+        assert "<msg-source@test.com>" in db.get_notified_map("alert-b")
+
+    def test_per_consumer_isolation_and_unmark(self, db):
+        db.upsert_email_metadata(
+            message_id="<iso@test.com>",
+            account="acct@test.com",
+            is_unread=True,
+            source_id="src-iso",
+        )
+        db.mark_notified(["<iso@test.com>"], consumer="consumer-A")
+        assert "<iso@test.com>" in db.get_notified_map("consumer-A")
+        assert "<iso@test.com>" not in db.get_notified_map("consumer-B")
+
+        # Unmarking via source_id removes only consumer-A's flag
+        db.mark_notified(["<iso@test.com>"], consumer="consumer-B")
+        unmark_res = db.unmark_notified(["src-iso"], consumer="consumer-A")
+        assert unmark_res["unmarked_count"] == 1
+        assert "<iso@test.com>" not in db.get_notified_map("consumer-A")
+        assert "<iso@test.com>" in db.get_notified_map("consumer-B")
+
+    def test_list_notified_and_since_days_filter(self, db):
+        from datetime import datetime, timezone, timedelta
+
+        db.upsert_email_metadata(
+            message_id="<recent@test.com>",
+            account="acct@test.com",
+            sender="s@test.com",
+            subject="Recent",
+            is_unread=True,
+        )
+        db.upsert_email_metadata(
+            message_id="<older@test.com>",
+            account="acct@test.com",
+            sender="s@test.com",
+            subject="Older",
+            is_unread=True,
+        )
+        db.mark_notified(["<recent@test.com>", "<older@test.com>"], consumer="c1", profile="stone")
+
+        old_ts = (datetime.now(tz=timezone.utc) - timedelta(days=5)).isoformat()
+        with db._get_connection() as conn:
+            conn.execute(
+                "UPDATE email_notifications SET notified_at = ? WHERE message_id = ?",
+                (old_ts, "<older@test.com>"),
+            )
+            conn.commit()
+
+        all_listed = db.list_notified(consumer="c1", profile="stone")
+        assert all_listed["count"] == 2
+        recent_only = db.list_notified(consumer="c1", profile="stone", since_days=2)
+        assert recent_only["count"] == 1
+        assert recent_only["items"][0]["message_id"] == "<recent@test.com>"
+        assert recent_only["items"][0]["subject"] == "Recent"
+
+    def test_retention_pruning_and_cache_delete_trigger(self, db):
+        from datetime import datetime, timezone, timedelta
+
+        db.upsert_email_metadata(message_id="<expired@test.com>", account="acct@test.com", is_unread=True)
+        db.upsert_email_metadata(message_id="<cached@test.com>", account="acct@test.com", is_unread=True)
+        db.mark_notified(["<expired@test.com>", "<cached@test.com>"], consumer="c1")
+
+        expired_ts = (datetime.now(tz=timezone.utc) - timedelta(days=20)).isoformat()
+        with db._get_connection() as conn:
+            conn.execute(
+                "UPDATE email_notifications SET notified_at = ? WHERE message_id = ?",
+                (expired_ts, "<expired@test.com>"),
+            )
+            conn.commit()
+
+        # get_notified_map prunes rows older than notified_retention_days (default 14)
+        nmap = db.get_notified_map("c1")
+        assert "<expired@test.com>" not in nmap
+        assert "<cached@test.com>" in nmap
+
+        # Deleting the message from email_cache fires trg_email_cache_delete_notified
+        with db._get_connection() as conn:
+            conn.execute("DELETE FROM email_cache WHERE message_id = ?", ("<cached@test.com>",))
+            conn.commit()
+        assert "<cached@test.com>" not in db.get_notified_map("c1")

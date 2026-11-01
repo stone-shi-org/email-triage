@@ -60,9 +60,19 @@ DEFAULT_PROMPTS: Dict[str, str] = {
         "'tag' (a one word lowercase tag, e.g., \"personal\", \"vip\", \"promotion\", \"notification\")."
     ),
     "level_2_summarization": (
-        "Create clear, precise bulleted executive summaries. Be brief and highlight any requested task, conclusion, or deadline. "
+        "Write an ultra-concise executive summary of at most 2-3 short bullet points (around 300 characters or fewer total). "
+        "State only what the email is and what action is needed or by when; omit background and history. "
+        "Never describe HTML/CSS markup or ask the reader to paste the full email. "
         "You MUST return a valid JSON object containing exactly three fields: 'summary' (string), 'confidence_score' (float from 0.0 to 1.0), "
         "and 'tag' (a one word lowercase tag, e.g., \"personal\", \"vip\", \"update\")."
+    ),
+}
+
+_LEGACY_DEFAULT_PROMPTS: Dict[str, tuple[str, ...]] = {
+    "level_2_summarization": (
+        "Create clear, precise bulleted executive summaries. Be brief and highlight any requested task, conclusion, or deadline. "
+        "You MUST return a valid JSON object containing exactly three fields: 'summary' (string), 'confidence_score' (float from 0.0 to 1.0), "
+        "and 'tag' (a one word lowercase tag, e.g., \"personal\", \"vip\", \"update\").",
     ),
 }
 
@@ -137,12 +147,13 @@ def seed_from_yaml_or_defaults(conn: sqlite3.Connection, yaml_path: Optional[Pat
     """Idempotent, per-key: any prompt key not already present in the DB gets
     seeded from prompts.yml (if it defines that key), else the hardcoded
     default. Existing DB rows -- including anything an admin has already
-    edited -- are never touched. Returns the number of keys seeded, so a
+    edited -- are never touched (except unedited legacy default strings). Returns the number of keys seeded, so a
     caller can log it once at startup."""
     yaml_prompts = load_yaml_prompts(yaml_path) if yaml_path else {}
     seeded = 0
     for key in DEFAULT_PROMPTS:
-        if get_prompt(conn, key) is not None:
+        existing = get_prompt(conn, key)
+        if existing is not None and existing not in _LEGACY_DEFAULT_PROMPTS.get(key, ()):
             continue
         set_prompt(conn, key, yaml_prompts.get(key, DEFAULT_PROMPTS[key]))
         seeded += 1

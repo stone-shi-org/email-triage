@@ -444,3 +444,38 @@ class TestFetchFullEmail:
             "body": "full body text",
             "account": "me@example.com",
         }
+
+
+class TestParseFullMessageBodyNested:
+    @staticmethod
+    def _b64(text: str) -> str:
+        import base64
+        return base64.urlsafe_b64encode(text.encode("utf-8")).decode("utf-8")
+
+    def test_prefers_plain_over_html_regardless_of_part_order(self):
+        msg = {
+            "payload": {
+                "mimeType": "multipart/alternative",
+                "parts": [
+                    {"mimeType": "text/html", "body": {"data": self._b64("<p>HTML version</p>")}},
+                    {"mimeType": "text/plain", "body": {"data": self._b64("Plain text version")}},
+                ],
+            }
+        }
+        assert gmail_client.GmailClient._parse_full_message_body(msg) == "Plain text version"
+
+    def test_extracts_nested_html_when_no_plain_part_exists(self):
+        msg = {
+            "payload": {
+                "mimeType": "multipart/mixed",
+                "parts": [
+                    {
+                        "mimeType": "multipart/related",
+                        "parts": [
+                            {"mimeType": "text/html", "body": {"data": self._b64("<html><body>Nested HTML</body></html>")}},
+                        ],
+                    }
+                ],
+            }
+        }
+        assert gmail_client.GmailClient._parse_full_message_body(msg) == "<html><body>Nested HTML</body></html>"

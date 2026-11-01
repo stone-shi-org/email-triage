@@ -1,3 +1,4 @@
+import html
 import logging
 import math
 import re
@@ -93,6 +94,111 @@ def strip_invisible(text: str) -> str:
     if not text:
         return text
     return _FILLER_ZWJ_RE.sub("", _INVISIBLE_CHARS_RE.sub("", text))
+
+
+_HTML_TAG_DETECT_RE = re.compile(
+    r"<!doctype\s+html|<\s*/?\s*(?:html|head|body|style|script|meta|link|title|table|tbody|thead|tfoot|tr|td|th|div|span|p|br|hr|a|img|ul|ol|li|h[1-6]|font|center|section|article|header|footer|blockquote|svg|form|input|button)\b",
+    re.IGNORECASE,
+)
+_HTML_COMMENT_RE = re.compile(r"<!--.*?(?:-->|$)", re.DOTALL)
+_HTML_STRIP_BLOCK_RE = re.compile(
+    r"<\s*(style|script|head|title|svg|noscript)\b[^>]*>.*?(?:<\s*/\s*\1\s*>|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+_HTML_NEWLINE_TAG_RE = re.compile(
+    r"<\s*(?:br|hr|/p|/div|/tr|/li|/h[1-6]|/table|/blockquote|/section|/article|/header|/footer)\b[^>]*>",
+    re.IGNORECASE,
+)
+_HTML_LI_OPEN_RE = re.compile(r"<\s*li\b[^>]*>", re.IGNORECASE)
+_HTML_ANY_TAG_RE = re.compile(r"<[^>]+>|<\s*[a-zA-Z!/][^>]*$", re.DOTALL)
+_CSS_RULE_BLOCK_RE = re.compile(
+    r"(?:@[a-zA-Z-]+[^{]*\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}|"
+    r"(?:^|\n)\s*[a-zA-Z0-9_.\-#*:\[\]\s,>+~]{1,120}\{[^{}]*:[^{}]*\})",
+    re.DOTALL,
+)
+_CSS_TRUNCATED_TAIL_RE = re.compile(
+    r"(?:^|\n)\s*(?:@[a-zA-Z-]+[^{]*|[a-zA-Z0-9_.\-#*:\[\]\s,>+~]{1,120})\{[^{}]*$",
+    re.DOTALL,
+)
+_BOILERPLATE_COMPLAINT_RE = re.compile(
+    r"(?:paste\s+the\s+full\s+email|"
+    r"share\s+the\s+actual\s+message|"
+    r"only\s+html(?:/css)?\s+(?:email\s+)?(?:boilerplate|markup|styling|code)|"
+    r"contains\s+only\s+html(?:/css)?|"
+    r"only\s+contains\s+html(?:/css)?|"
+    r"cut(?:s)?\s+off\s+before\s+any\s+readable|"
+    r"truncated\s+mid-(?:tag|style|html|css)|"
+    r"no\s+actual\s+email\s+content|"
+    r"no\s+readable\s+message\s+text)",
+    re.IGNORECASE,
+)
+
+
+def extract_readable_body(text: str) -> str:
+    """Extract readable plain text from an email body before truncation.
+
+    Handles raw HTML emails (where `<head><style>...</style></head>` can easily exceed 8,000 chars
+    before any visible `<body>` text appears) as well as truncated HTML/CSS payloads. Plain-text
+    emails pass through with only invisible-character stripping.
+    """
+    if not text:
+        return ""
+    cleaned = strip_invisible(text)
+    if not cleaned:
+        return ""
+
+    looks_like_html = bool(_HTML_TAG_DETECT_RE.search(cleaned))
+    looks_like_css = bool(_CSS_RULE_BLOCK_RE.search(cleaned))
+    if not looks_like_html and not looks_like_css:
+        return cleaned
+
+    cleaned = _HTML_COMMENT_RE.sub(" ", cleaned)
+    cleaned = _HTML_STRIP_BLOCK_RE.sub(" ", cleaned)
+    cleaned = _HTML_LI_OPEN_RE.sub("\n- ", cleaned)
+    cleaned = _HTML_NEWLINE_TAG_RE.sub("\n", cleaned)
+    cleaned = _HTML_ANY_TAG_RE.sub(" ", cleaned)
+    cleaned = html.unescape(cleaned).replace("\xa0", " ")
+    cleaned = strip_invisible(cleaned)
+
+    # Remove any leaked raw CSS rule blocks or trailing truncated CSS block
+    prev = None
+    while prev != cleaned:
+        prev = cleaned
+        cleaned = _CSS_RULE_BLOCK_RE.sub("\n", cleaned)
+    cleaned = _CSS_TRUNCATED_TAIL_RE.sub("", cleaned)
+
+    lines: List[str] = []
+    for raw_line in cleaned.splitlines():
+        line = re.sub(r"[ \t]+", " ", raw_line).strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _is_boilerplate_complaint(summary: str) -> bool:
+    """Return True if an LLM summary describes HTML/CSS markup or asks to paste the full email."""
+    if not summary:
+        return False
+    return bool(_BOILERPLATE_COMPLAINT_RE.search(summary))
+
+
+def _format_short_summary(summary: str, max_bullets: int = 3, max_chars: int = 300) -> str:
+    """Enforce the concise Level 2 summary budget (at most `max_bullets` bullets and `max_chars` chars)."""
+    if not summary:
+        return ""
+    lines = [line.strip() for line in summary.strip().splitlines() if line.strip()]
+    if not lines:
+        return ""
+    if len(lines) > max_bullets:
+        lines = lines[:max_bullets]
+    formatted = "\n".join(lines)
+    if len(formatted) <= max_chars:
+        return formatted
+    clipped = formatted[: max_chars - 3].rstrip()
+    last_space = clipped.rfind(" ")
+    if last_space >= max_chars // 2:
+        clipped = clipped[:last_space].rstrip(" ,;:-")
+    return f"{clipped}..."
 
 
 # A fenced block anywhere in the response, capturing its info string (```json / ``` / ```JSON)
@@ -581,9 +687,13 @@ class EmailTriageEngine:
         if not full_body or len(full_body.strip()) < 10:
             return "No substantive content to summarize.", 0.0, "notification", metrics
 
-        # Cleaned before the slice so the 8000-char budget goes to real content, not padding
-        subject, full_body = strip_invisible(subject), strip_invisible(full_body)
-        prompt = f"Subject: {subject}\nBody:\n{full_body[:8000]}"
+        # Cleaned (and HTML/CSS-stripped) before the slice so the 8000-char budget goes to real content, not styling/padding
+        subject = strip_invisible(subject)
+        cleaned_body = extract_readable_body(full_body)
+        if not cleaned_body or len(cleaned_body.strip()) < 10:
+            return "Summary unavailable: email body contained no extractable text.", 0.0, "summary_unavailable", metrics
+
+        prompt = f"Subject: {subject}\nBody:\n{cleaned_body[:8000]}"
         system_instruction = self.prompts.get("level_2_summarization", {}).get("system")
         if not system_instruction:
             system_instruction = prompts_store.DEFAULT_PROMPTS["level_2_summarization"]
@@ -625,10 +735,19 @@ class EmailTriageEngine:
                 raise e
             
             result = SummaryResult.model_validate(result_dict)
+            if _is_boilerplate_complaint(result.summary):
+                logger.warning(
+                    "Level 2 summary for '%s' reported unextractable HTML/boilerplate; replacing with unavailable note.",
+                    subject,
+                )
+                metrics["duration_sec"] = time.time() - start_time
+                return "Summary unavailable: email body could not be extracted.", 0.0, "summary_unavailable", metrics
+
+            short_summary = _format_short_summary(result.summary)
             logger.info("Level 2 summary successfully generated for '%s' (Score: %s, Tag: %s)", subject, result.confidence_score, result.tag)
             
             metrics["duration_sec"] = time.time() - start_time
-            return result.summary, result.confidence_score, result.tag, metrics
+            return short_summary, result.confidence_score, result.tag, metrics
         except Exception as e:
             logger.error("Level 2 LiteLLM summarization failed: %s", e)
             if 'content' in locals():
@@ -644,9 +763,9 @@ class EmailTriageEngine:
         Secondary Premium Triage Escalation layer: Uses the premium summary model and full text body 
         to re-evaluate borderline/ambiguous classification choices definitively.
         """
-        # Cleaned before the slice so the 6000-char budget goes to real content, not padding
-        sender, subject, snippet, full_body = (strip_invisible(sender), strip_invisible(subject),
-                                               strip_invisible(snippet), strip_invisible(full_body))
+        # Cleaned (and HTML/CSS-stripped) before the slice so the 6000-char budget goes to real content, not styling/padding
+        sender, subject, snippet = (strip_invisible(sender), strip_invisible(subject), strip_invisible(snippet))
+        full_body = extract_readable_body(full_body)
         prompt = f"Sender: {sender}\nSubject: {subject}\nSnippet: {snippet}\nFull Body Content:\n{full_body[:6000]}"
         system_instruction = self.prompts.get("level_1_premium_escalation", {}).get("system")
         if not system_instruction:

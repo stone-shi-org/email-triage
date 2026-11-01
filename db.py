@@ -9,10 +9,21 @@ logger = logging.getLogger("email_triage.db")
 
 class EmailDB:
     def __init__(self, db_path: Optional[Path] = None, settings_instance: Optional[Any] = None):
+        active_settings = settings_instance if settings_instance else settings
         if db_path is None:
-            active_settings = settings_instance if settings_instance else settings
             db_path = active_settings.workspace_dir / "email_cache.db"
         self.db_path = db_path
+        ws_dir = getattr(active_settings, "workspace_dir", None)
+        if ws_dir is not None and ws_dir.parent.name == "profiles":
+            self.profile_name = ws_dir.name
+        else:
+            self.profile_name = "default"
+        triage_cfg = getattr(active_settings, "triage", None)
+        raw_retention = getattr(triage_cfg, "notified_retention_days", 14)
+        if isinstance(raw_retention, int) and not isinstance(raw_retention, bool):
+            self.notified_retention_days = raw_retention
+        else:
+            self.notified_retention_days = 14
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
@@ -156,6 +167,34 @@ class EmailDB:
                         account TEXT PRIMARY KEY,
                         checkpoint_val TEXT NOT NULL
                     )
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS email_notifications (
+                        profile TEXT NOT NULL DEFAULT 'default',
+                        consumer TEXT NOT NULL,
+                        message_id TEXT NOT NULL,
+                        notified_at TEXT NOT NULL,
+                        PRIMARY KEY (consumer, message_id)
+                    )
+                """)
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_email_notifications_consumer_date "
+                    "ON email_notifications(consumer, notified_at)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_email_notifications_message_id "
+                    "ON email_notifications(message_id)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_email_cache_source_id "
+                    "ON email_cache(source_id)"
+                )
+                cursor.execute("""
+                    CREATE TRIGGER IF NOT EXISTS trg_email_cache_delete_notified
+                    AFTER DELETE ON email_cache
+                    BEGIN
+                        DELETE FROM email_notifications WHERE message_id = OLD.message_id;
+                    END
                 """)
                 conn.commit()
             logger.debug("SQLite Database initialized at %s", self.db_path)
@@ -682,3 +721,240 @@ class EmailDB:
         except Exception as e:
             logger.error("Failed to fetch daily important emails: %s", e)
             return []
+
+    @staticmethod
+    def _normalize_consumer(consumer: Optional[str]) -> str:
+        val = (consumer or "").strip()
+        return val if val else "default"
+
+    @staticmethod
+    def _resolve_message_id_in_conn(conn: sqlite3.Connection, raw_id: str) -> str:
+        """Resolve a caller-supplied identifier (RFC Message-ID or source_id) to canonical message_id."""
+        cleaned = (raw_id or "").strip()
+        if not cleaned:
+            return ""
+        cursor = conn.cursor()
+        # 1. Exact match on message_id
+        cursor.execute("SELECT message_id FROM email_cache WHERE message_id = ?", (cleaned,))
+        row = cursor.fetchone()
+        if row and row[0]:
+            return str(row[0])
+        # 2. Match with or without angle brackets on message_id
+        alt = cleaned[1:-1].strip() if (cleaned.startswith("<") and cleaned.endswith(">")) else f"<{cleaned}>"
+        if alt and alt != cleaned:
+            cursor.execute("SELECT message_id FROM email_cache WHERE message_id = ?", (alt,))
+            row = cursor.fetchone()
+            if row and row[0]:
+                return str(row[0])
+        # 3. Match on source_id (e.g. Gmail hex message ID or IMAP UID)
+        cursor.execute(
+            "SELECT message_id FROM email_cache WHERE source_id = ? ORDER BY processed_at DESC LIMIT 1",
+            (cleaned,),
+        )
+        row = cursor.fetchone()
+        if row and row[0]:
+            return str(row[0])
+        return cleaned
+
+    def prune_notified(
+        self,
+        retention_days: Optional[int] = None,
+        prune_uncached: bool = False,
+    ) -> int:
+        """Delete notification state rows older than `retention_days` (default: self.notified_retention_days),
+        and optionally rows whose message_id is no longer in `email_cache`."""
+        from datetime import timedelta
+
+        days = self.notified_retention_days if retention_days is None else int(retention_days)
+        deleted = 0
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                if days > 0:
+                    cutoff = (datetime.now(tz=timezone.utc) - timedelta(days=days)).isoformat()
+                    cursor.execute(
+                        "DELETE FROM email_notifications WHERE notified_at < ?",
+                        (cutoff,),
+                    )
+                    deleted += max(cursor.rowcount, 0)
+                if prune_uncached:
+                    cursor.execute(
+                        """
+                        DELETE FROM email_notifications
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM email_cache c WHERE c.message_id = email_notifications.message_id
+                        )
+                        """
+                    )
+                    deleted += max(cursor.rowcount, 0)
+                conn.commit()
+            return deleted
+        except Exception as e:
+            logger.error("Failed to prune notified rows: %s", e)
+            return deleted
+
+    def mark_notified(
+        self,
+        message_ids: List[str],
+        consumer: str = "default",
+        profile: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Idempotently mark messages as notified for `consumer` in the local triage DB.
+        Accepts either RFC Message-ID or provider source_id. Never modifies mailbox or email_cache read state."""
+        norm_consumer = self._normalize_consumer(consumer)
+        norm_profile = (profile or "").strip() or self.profile_name or "default"
+        self.prune_notified()
+
+        resolved_ids: List[str] = []
+        newly_marked: List[str] = []
+        already_notified: List[str] = []
+        now_iso = datetime.now(tz=timezone.utc).isoformat()
+
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                for raw in message_ids or []:
+                    if not isinstance(raw, str) or not raw.strip():
+                        continue
+                    canonical_id = self._resolve_message_id_in_conn(conn, raw)
+                    if not canonical_id:
+                        continue
+                    resolved_ids.append(canonical_id)
+                    cursor.execute(
+                        """
+                        INSERT OR IGNORE INTO email_notifications (profile, consumer, message_id, notified_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (norm_profile, norm_consumer, canonical_id, now_iso),
+                    )
+                    if cursor.rowcount and cursor.rowcount > 0:
+                        newly_marked.append(canonical_id)
+                    else:
+                        already_notified.append(canonical_id)
+                conn.commit()
+        except Exception as e:
+            logger.error("Failed to mark_notified for consumer %s: %s", norm_consumer, e)
+
+        return {
+            "profile": norm_profile,
+            "consumer": norm_consumer,
+            "marked_count": len(newly_marked),
+            "already_notified_count": len(already_notified),
+            "marked_ids": newly_marked,
+            "already_notified_ids": already_notified,
+            "resolved_ids": resolved_ids,
+        }
+
+    def unmark_notified(
+        self,
+        message_ids: List[str],
+        consumer: str = "default",
+        profile: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Remove the notified flag for the given messages and consumer."""
+        norm_consumer = self._normalize_consumer(consumer)
+        norm_profile = (profile or "").strip() or self.profile_name or "default"
+        removed_ids: List[str] = []
+        resolved_ids: List[str] = []
+
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                for raw in message_ids or []:
+                    if not isinstance(raw, str) or not raw.strip():
+                        continue
+                    canonical_id = self._resolve_message_id_in_conn(conn, raw)
+                    if not canonical_id:
+                        continue
+                    resolved_ids.append(canonical_id)
+                    cursor.execute(
+                        "DELETE FROM email_notifications WHERE consumer = ? AND message_id = ?",
+                        (norm_consumer, canonical_id),
+                    )
+                    if cursor.rowcount and cursor.rowcount > 0:
+                        removed_ids.append(canonical_id)
+                conn.commit()
+        except Exception as e:
+            logger.error("Failed to unmark_notified for consumer %s: %s", norm_consumer, e)
+
+        return {
+            "profile": norm_profile,
+            "consumer": norm_consumer,
+            "unmarked_count": len(removed_ids),
+            "unmarked_ids": removed_ids,
+            "resolved_ids": resolved_ids,
+        }
+
+    def get_notified_map(self, consumer: str = "default") -> Dict[str, str]:
+        """Return `{message_id: notified_at}` for all active notifications for `consumer`."""
+        norm_consumer = self._normalize_consumer(consumer)
+        self.prune_notified()
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT message_id, notified_at FROM email_notifications WHERE consumer = ?",
+                    (norm_consumer,),
+                )
+                return {str(row[0]): str(row[1]) for row in cursor.fetchall() if row and row[0]}
+        except Exception as e:
+            logger.error("Failed to fetch notified map for consumer %s: %s", norm_consumer, e)
+            return {}
+
+    def list_notified(
+        self,
+        consumer: str = "default",
+        profile: Optional[str] = None,
+        since_days: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """List notified messages for `consumer` (optionally filtered to the last `since_days` days)."""
+        from datetime import timedelta
+
+        norm_consumer = self._normalize_consumer(consumer)
+        norm_profile = (profile or "").strip() or self.profile_name or "default"
+        self.prune_notified()
+
+        items: List[Dict[str, Any]] = []
+        try:
+            with self._get_connection() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                params: List[Any] = [norm_consumer]
+                where_clause = "WHERE n.consumer = ?"
+                if since_days is not None and int(since_days) > 0:
+                    cutoff = (datetime.now(tz=timezone.utc) - timedelta(days=int(since_days))).isoformat()
+                    where_clause += " AND n.notified_at >= ?"
+                    params.append(cutoff)
+                cursor.execute(
+                    f"""
+                    SELECT
+                        n.profile,
+                        n.consumer,
+                        n.message_id,
+                        n.notified_at,
+                        c.source_id,
+                        c.account,
+                        c.sender,
+                        c.subject,
+                        c.date_str,
+                        c.triage_level
+                    FROM email_notifications n
+                    LEFT JOIN email_cache c ON c.message_id = n.message_id
+                    {where_clause}
+                    ORDER BY n.notified_at DESC
+                    """,
+                    tuple(params),
+                )
+                for row in cursor.fetchall():
+                    d = dict(row)
+                    d["profile"] = d.get("profile") or norm_profile
+                    items.append(d)
+        except Exception as e:
+            logger.error("Failed to list_notified for consumer %s: %s", norm_consumer, e)
+
+        return {
+            "profile": norm_profile,
+            "consumer": norm_consumer,
+            "count": len(items),
+            "items": items,
+        }

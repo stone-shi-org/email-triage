@@ -177,6 +177,14 @@ class TriageSettings(BaseModel):
     blacklist_senders: List[str] = [
         "spammer@domain.com", "offers@", "newsletters@"
     ]
+    notified_retention_days: int = Field(
+        default_factory=lambda: int(
+            os.getenv(
+                "EMAIL_TRIAGE_NOTIFIED_RETENTION_DAYS",
+                os.getenv("EMAIL_TRIAGE_TRIAGE__NOTIFIED_RETENTION_DAYS", "14"),
+            )
+        )
+    )
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -330,6 +338,12 @@ class Settings(BaseSettings):
                     self.triage.blacklist_keywords = triage_data["blacklist_keywords"]
                 if "blacklist_senders" in triage_data and should_apply("EMAIL_TRIAGE_TRIAGE__BLACKLIST_SENDERS"):
                     self.triage.blacklist_senders = triage_data["blacklist_senders"]
+                if (
+                    "notified_retention_days" in triage_data
+                    and should_apply("EMAIL_TRIAGE_NOTIFIED_RETENTION_DAYS")
+                    and should_apply("EMAIL_TRIAGE_TRIAGE__NOTIFIED_RETENTION_DAYS")
+                ):
+                    self.triage.notified_retention_days = int(triage_data["notified_retention_days"])
                     
                 # Map Logging section
                 logging_data = yaml_data.get("logging", {})

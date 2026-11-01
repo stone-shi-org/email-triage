@@ -9,7 +9,14 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from triage import EmailTriageEngine, TriageDecision, SummaryResult, strip_invisible, extract_json
+from triage import (
+    EmailTriageEngine,
+    TriageDecision,
+    SummaryResult,
+    strip_invisible,
+    extract_readable_body,
+    extract_json,
+)
 from db import EmailDB
 
 
@@ -942,3 +949,105 @@ class TestTEIClassifierPath:
             )
         assert level == 2
         assert "error" in reason.lower()
+
+
+class TestHtmlExtractionAndShortLevel2Summaries:
+    def test_extract_readable_body_strips_large_style_before_truncation(self):
+        # Simulate an HTML email where <head><style> exceeds 8,000 characters before the body text
+        huge_css = ".rule { color: #006fcf; font-family: Arial, sans-serif; }\n" * 200  # > 11,000 chars
+        html_doc = (
+            f"<!DOCTYPE html><html><head><style>{huge_css}</style></head>"
+            "<body><table><tr><td><p>Dear Card Member, your dispute #9981 has been resolved in your favor.</p>"
+            "<p>No further action is required; a $145.00 credit will appear on your next statement.</p>"
+            "</td></tr></table></body></html>"
+        )
+        extracted = extract_readable_body(html_doc)
+        assert ".rule" not in extracted
+        assert "dispute #9981 has been resolved" in extracted
+        assert "145.00 credit" in extracted
+
+    def test_extract_readable_body_handles_truncated_html_with_only_css(self):
+        truncated_html = (
+            "<html><head><meta charset='utf-8'><style>"
+            "body { margin: 0; padding: 0; } .header { background: #fff; font-size: 14px; "
+        )
+        assert extract_readable_body(truncated_html) == ""
+
+    def test_level_2_summarization_html_only_returns_unavailable_without_calling_llm(self, engine):
+        html_only = (
+            "<!DOCTYPE html><html><head><style>"
+            "body { margin: 0; padding: 0; font-family: sans-serif; } "
+            ".sf-layout { width: 600px; border-collapse: collapse; }"
+            "</style></head><body><table role='presentation'><tr><td></td></tr></table></body></html>"
+        )
+        with patch.object(engine.http_client, "post") as mock_post:
+            summary, score, tag, metrics = engine.run_level_2_summarization(
+                "Welcome to Salesforce", html_only
+            )
+        mock_post.assert_not_called()
+        assert tag == "summary_unavailable"
+        assert score == 0.0
+        assert "Summary unavailable" in summary
+        assert "paste the full email" not in summary.lower()
+
+    def test_level_2_summarization_intercepts_llm_boilerplate_complaint(self, engine):
+        bad_llm_summary = (
+            "- The provided body contains only HTML/CSS email boilerplate (truncated mid-`<style>` block).\n"
+            "- Action needed: Paste the full email text if you want a summary."
+        )
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "choices": [{
+                "message": {
+                    "content": json.dumps({
+                        "summary": bad_llm_summary,
+                        "confidence_score": 0.4,
+                        "tag": "notification",
+                    })
+                }
+            }],
+            "usage": {"prompt_tokens": 50, "completion_tokens": 30, "total_tokens": 80},
+        }
+        with patch.object(engine.http_client, "post", return_value=mock_response):
+            summary, score, tag, _ = engine.run_level_2_summarization(
+                "Important update regarding your Inquiry",
+                "Some non-empty body that passed initial check",
+            )
+        assert tag == "summary_unavailable"
+        assert score == 0.0
+        assert "Summary unavailable" in summary
+        assert "paste the full email" not in summary.lower()
+
+    def test_level_2_summarization_caps_bullets_and_length(self, engine):
+        verbose_summary = "\n".join([
+            "- Bullet 1: Please sign and return the Kirkland Landscapes contract addendum by Friday 5pm PT.",
+            "- Bullet 2: Confirm whether the irrigation trenching scope is approved for $1,200.",
+            "- Bullet 3: Reply directly to Avery Dokka to lock in the Monday crew schedule.",
+            "- Bullet 4: Background context on the prior lawn maintenance visits from October.",
+            "- Bullet 5: Extra historical note that should be dropped.",
+        ])
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "choices": [{
+                "message": {
+                    "content": json.dumps({
+                        "summary": verbose_summary,
+                        "confidence_score": 0.95,
+                        "tag": "personal",
+                    })
+                }
+            }],
+            "usage": {"prompt_tokens": 80, "completion_tokens": 60, "total_tokens": 140},
+        }
+        with patch.object(engine.http_client, "post", return_value=mock_response):
+            summary, score, tag, _ = engine.run_level_2_summarization(
+                "Re: Service Request - Kirkland Landscapes",
+                "Hi Stone, please sign the addendum by Friday and confirm the irrigation scope.",
+            )
+        lines = [line for line in summary.splitlines() if line.strip()]
+        assert len(lines) <= 3
+        assert len(summary) <= 300
+        assert "Bullet 4" not in summary
+        assert tag == "personal"

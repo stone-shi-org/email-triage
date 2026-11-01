@@ -35,6 +35,7 @@ triage:
     - "spammer@domain.com"
     - "offers@"
     - "newsletters@"
+  notified_retention_days: 14
 
 logging:
   level: "INFO"

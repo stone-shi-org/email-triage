@@ -59,6 +59,7 @@ RUNTIME_KEYS: Dict[str, SettingSpec] = {
         SettingSpec("triage.whitelist_domains", "json", "triage.whitelist_domains", user_overridable=True),
         SettingSpec("triage.blacklist_keywords", "json", "triage.blacklist_keywords", user_overridable=True),
         SettingSpec("triage.blacklist_senders", "json", "triage.blacklist_senders", user_overridable=True),
+        SettingSpec("triage.notified_retention_days", "int", "triage.notified_retention_days", user_overridable=True),
         # Scheduler -- global (process-wide already)
         SettingSpec("scheduler.enabled", "bool", "scheduler.enabled"),
         SettingSpec("scheduler.interval", "str", "scheduler.interval"),

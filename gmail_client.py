@@ -313,18 +313,28 @@ class GmailClient:
             return ""
 
         payload = msg.get('payload', {})
-        body = ""
+        plain_parts: List[str] = []
+        html_parts: List[str] = []
+
+        def walk_parts(part_list: List[Dict[str, Any]]) -> None:
+            for part in part_list:
+                mime_type = (part.get('mimeType') or '').lower()
+                if mime_type == 'text/plain':
+                    text = get_part_body(part)
+                    if text:
+                        plain_parts.append(text)
+                elif mime_type == 'text/html':
+                    html = get_part_body(part)
+                    if html:
+                        html_parts.append(html)
+                subparts = part.get('parts')
+                if isinstance(subparts, list) and subparts:
+                    walk_parts(subparts)
+
         parts = payload.get('parts', [])
         if parts:
-            for part in parts:
-                if part.get('mimeType') == 'text/plain':
-                    body += get_part_body(part)
-                elif part.get('mimeType') == 'text/html' and not body:
-                    body += get_part_body(part)
-                elif 'parts' in part:
-                    for subpart in part['parts']:
-                        if subpart.get('mimeType') == 'text/plain':
-                            body += get_part_body(subpart)
+            walk_parts(parts)
+            body = "".join(plain_parts) if plain_parts else "".join(html_parts)
         else:
             body = get_part_body(payload)
 

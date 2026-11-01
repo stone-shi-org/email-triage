@@ -120,7 +120,11 @@ calls for already-seen messages are free.
 Recommended tool-call ordering: call a read-only/status tool before any mutating tool.
 - Read-only / status first: fetch_and_process_unread (cache-only -- never hits Gmail/IMAP \
 directly; the cache is refreshed automatically by a background sync, so just call it), \
-get_last_download_time, search_emails (live mailbox search), fetch_full_email.
+get_last_download_time, list_notified, search_emails (live mailbox search), fetch_full_email.
+- Dedup / notification state (local triage DB only -- NEVER marks emails read in Gmail/IMAP): \
+mark_notified, unmark_notified. For recurring alert jobs (e.g. Level 2 alerts), use the flow: \
+fetch_and_process_unread(consumer="<name>", exclude_notified=True, min_level=2) -> send alert -> \
+mark_notified(message_ids=[...], consumer="<name>") with the IDs actually alerted.
 - Mutating (change mailbox/cache state): trigger_download (optional, rarely needed: starts a background sync and returns immediately), \
 mark_emails_as_read, create_new_draft, create_draft_reply, and send_email_reply -- the last is \
 irreversible (actually sends mail) and should be used with the most caution.
@@ -1395,11 +1399,101 @@ def _format_unread_id_suffix(item: Dict[str, Any]) -> str:
         suffix += f" [ID: {mid}]"
     if sid and sid != mid:
         suffix += f" (source_id: {sid})"
+    if "notified" in item:
+        notified_flag = bool(item.get("notified"))
+        notified_at = item.get("notified_at")
+        suffix += f" [notified: {notified_flag}, notified_at: {notified_at}]"
     return suffix
 
 
+def _format_header_count(total: int, notified_count: int) -> str:
+    if notified_count > 0:
+        return f"{total} ({notified_count} already notified)"
+    return str(total)
+
+
 @mcp.tool()
-def fetch_and_process_unread(max_per_source: int = 5, days: int = 7, profile: str = "default") -> str:
+def mark_notified(
+    message_ids: List[str],
+    consumer: str = "default",
+    profile: str = "default",
+) -> Dict[str, Any]:
+    """
+    Marks emails as notified for a specific `consumer` namespace in the local triage database.
+
+    IMPORTANT: This tool writes ONLY to the local triage database (`email_notifications`).
+    It NEVER marks any email as read in Gmail or IMAP and leaves mailbox read/unread state
+    completely untouched.
+
+    Intended alert deduplication workflow:
+    1. Call `fetch_and_process_unread(consumer="<consumer>", exclude_notified=True, min_level=2, profile="...")`
+       to retrieve only new, un-alerted items.
+    2. Deliver the alert (e.g. Telegram/Slack notification) to the user.
+    3. Call `mark_notified(message_ids=[...], consumer="<consumer>", profile="...")` with the IDs
+       that were actually alerted. Calling `mark_notified` twice for the same email is a safe no-op.
+
+    :param message_ids: List of email identifiers to mark as notified. Accepts either the RFC 2822
+                        Message-ID (with or without angle brackets) or the provider `source_id`.
+    :param consumer: Free-form consumer key (e.g. "pa-important-emails", "pa-digest") scoped within
+                     the profile so different agents or jobs do not hide emails from one another.
+    :param profile: The dynamic profile environment to load (default: "default").
+    :return: A dictionary with `marked_count`, `already_notified_count`, `marked_ids`, and `consumer`.
+    """
+    profile = _effective_profile(profile)
+    db, _, _ = get_resources(profile)
+    return db.mark_notified(message_ids=message_ids, consumer=consumer, profile=profile)
+
+
+@mcp.tool()
+def unmark_notified(
+    message_ids: List[str],
+    consumer: str = "default",
+    profile: str = "default",
+) -> Dict[str, Any]:
+    """
+    Clears the per-consumer "notified" flag for the specified emails in the local triage database
+    (for corrections, retries, or testing).
+
+    Writes ONLY to the local triage database and NEVER modifies Gmail/IMAP read/unread state.
+
+    :param message_ids: List of RFC Message-IDs or provider `source_id`s to unmark.
+    :param consumer: Consumer namespace (default: "default").
+    :param profile: The dynamic profile environment to load (default: "default").
+    :return: A dictionary with `unmarked_count`, `unmarked_ids`, and `consumer`.
+    """
+    profile = _effective_profile(profile)
+    db, _, _ = get_resources(profile)
+    return db.unmark_notified(message_ids=message_ids, consumer=consumer, profile=profile)
+
+
+@mcp.tool()
+def list_notified(
+    consumer: str = "default",
+    profile: str = "default",
+    since_days: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Lists emails currently marked as notified for `consumer` in the local triage database (for debugging).
+
+    :param consumer: Consumer namespace to inspect (default: "default").
+    :param profile: The dynamic profile environment to load (default: "default").
+    :param since_days: Optional filter to only return notifications recorded within the past N days.
+    :return: A dictionary containing `profile`, `consumer`, `count`, and `items`.
+    """
+    profile = _effective_profile(profile)
+    db, _, _ = get_resources(profile)
+    return db.list_notified(consumer=consumer, profile=profile, since_days=since_days)
+
+
+@mcp.tool()
+def fetch_and_process_unread(
+    max_per_source: int = 5,
+    days: int = 7,
+    profile: str = "default",
+    consumer: Optional[str] = None,
+    exclude_notified: bool = False,
+    min_level: Optional[int] = None,
+) -> str:
     """
     Returns triage details/summaries for currently-unread emails FROM THE LOCAL CACHE.
 
@@ -1408,9 +1502,23 @@ def fetch_and_process_unread(max_per_source: int = 5, days: int = 7, profile: st
     directly -- no need to refresh first. Only use `trigger_download` if the user explicitly asks
     for a refresh, and `get_last_download_time` only if results look stale or incomplete.
 
-    :param max_per_source: Maximum number of cached unread items to return per account source.
+    Intended alert deduplication flow (never marks emails read in Gmail/IMAP):
+    1. Call `fetch_and_process_unread(consumer="<consumer>", exclude_notified=True, min_level=2)`
+       to fetch only un-notified Level 2 emails. Header counts still report how many items were
+       hidden (e.g. `5 (3 already notified)`), so you can distinguish "nothing new" from "nothing at all".
+    2. Send your alert for the returned items.
+    3. Call `mark_notified(message_ids=[...], consumer="<consumer>")` with the IDs actually alerted.
+
+    :param max_per_source: Maximum number of cached unread items to scan per account source.
     :param days: Only include unread emails received within this number of past days.
     :param profile: Dynamic profile environment to load (default: "default").
+    :param consumer: Optional consumer namespace (e.g. "pa-important-emails", "pa-digest"). When
+                     provided, each item includes `notified` (bool) and `notified_at` for that consumer.
+                     Defaults to "default" when `exclude_notified=True` and `consumer` is omitted.
+    :param exclude_notified: If True, omits items already marked notified for `consumer` from the
+                             returned item list while still reporting them in the header counts.
+    :param min_level: Optional minimum triage level (0, 1, or 2) to include in the returned item
+                      list (e.g. `min_level=2` to return only Level 2 items).
     :return: A formatted string summary of currently-unread, cached triage results.
     """
     profile = _effective_profile(profile)
@@ -1422,8 +1530,27 @@ def fetch_and_process_unread(max_per_source: int = 5, days: int = 7, profile: st
         "important_identified": 0,
         "pending_triage": 0,
     }
+    notified_stats = {
+        "scanned": 0,
+        "level_0_filtered": 0,
+        "level_1_unimportant": 0,
+        "important_identified": 0,
+        "pending_triage": 0,
+    }
     run_results: List[Dict[str, Any]] = []
     pending: List[Dict[str, Any]] = []
+
+    effective_consumer: Optional[str] = None
+    if consumer is not None and consumer.strip():
+        effective_consumer = consumer.strip()
+    elif exclude_notified:
+        effective_consumer = "default"
+
+    notified_map: Dict[str, str] = {}
+    if effective_consumer is not None:
+        raw_map = db.get_notified_map(effective_consumer)
+        if isinstance(raw_map, dict):
+            notified_map = raw_map
 
     accounts_meta = _resolve_account_metadata(profile)
     if accounts_meta is not None:
@@ -1445,18 +1572,48 @@ def fetch_and_process_unread(max_per_source: int = 5, days: int = 7, profile: st
         rows_for_filter = [{**r, "date": r.get("date_str", "")} for r in rows]
         rows_for_filter = filter_emails_by_days(rows_for_filter, days)[:max_per_source]
         for r in rows_for_filter:
+            mid = r.get("message_id") or ""
+            sid = r.get("source_id") or ""
+            notified_at: Optional[str] = None
+            is_notified = False
+            if effective_consumer is not None:
+                notified_at = notified_map.get(mid) or (notified_map.get(sid) if sid else None)
+                is_notified = bool(notified_at)
+                r = {**r, "notified": is_notified, "notified_at": notified_at}
+
             stats["scanned"] += 1
+            if is_notified:
+                notified_stats["scanned"] += 1
+
             if r.get("triage_level") is None:
                 stats["pending_triage"] += 1
+                if is_notified:
+                    notified_stats["pending_triage"] += 1
+                if exclude_notified and is_notified:
+                    continue
+                if min_level is not None and min_level > 0:
+                    continue
                 pending.append(r)
                 continue
+
             lvl = r["triage_level"]
             if lvl == 0:
                 stats["level_0_filtered"] += 1
+                if is_notified:
+                    notified_stats["level_0_filtered"] += 1
             elif lvl == 1:
                 stats["level_1_unimportant"] += 1
+                if is_notified:
+                    notified_stats["level_1_unimportant"] += 1
             elif lvl == 2:
                 stats["important_identified"] += 1
+                if is_notified:
+                    notified_stats["important_identified"] += 1
+
+            if exclude_notified and is_notified:
+                continue
+            if min_level is not None and lvl < min_level:
+                continue
             run_results.append(r)
 
     # A message only counts as "shown" once it's actually rendered to the user below -- pending
@@ -1466,11 +1623,11 @@ def fetch_and_process_unread(max_per_source: int = 5, days: int = 7, profile: st
     # Render detailed textual overview for the agent
     lines = [
         "## Email Triage Execution Summary (from local cache)",
-        f"- **Total Scanned**: {stats['scanned']}",
-        f"- **Level 0 (Noise Filtered)**: {stats['level_0_filtered']}",
-        f"- **Level 1 (Low Importance)**: {stats['level_1_unimportant']}",
-        f"- **Level 2 (Premium Summarized & Flagged)**: {stats['important_identified']}",
-        f"- **Pending Background Triage**: {stats['pending_triage']}",
+        f"- **Total Scanned**: {_format_header_count(stats['scanned'], notified_stats['scanned'])}",
+        f"- **Level 0 (Noise Filtered)**: {_format_header_count(stats['level_0_filtered'], notified_stats['level_0_filtered'])}",
+        f"- **Level 1 (Low Importance)**: {_format_header_count(stats['level_1_unimportant'], notified_stats['level_1_unimportant'])}",
+        f"- **Level 2 (Premium Summarized & Flagged)**: {_format_header_count(stats['important_identified'], notified_stats['important_identified'])}",
+        f"- **Pending Background Triage**: {_format_header_count(stats['pending_triage'], notified_stats['pending_triage'])}",
         "\n### Unread Items:\n"
     ]
 
